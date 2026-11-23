@@ -1930,65 +1930,34 @@ ShowKinectStopped = function()
 
 end
 -- ============================================================
--- SHOW RECORDER WHEN SMH OPENS
+-- HUB REGISTRATION
+-- The recorder no longer opens/closes/moves by itself with SMH.
+-- Open it from the "Kinect Recorder" button above the SMH timeline
+-- (or with the smh_kinect_menu console command).
 -- ============================================================
 
-local smhWasOpen = false
+local function RegisterKinectWithHub()
+    if not (SMHToolsHub and SMHToolsHub.Register) then return false end
+    SMHToolsHub.Register({
+        id = "kinect_recorder",
+        name = "Kinect Recorder",
+        open = function() OpenKinectRecorderMenu() end,
+        close = function()
+            if IsValid(SMH_KinectRecorderMenu) then SMH_KinectRecorderMenu:Close() end
+        end,
+        isOpen = function()
+            return IsValid(SMH_KinectRecorderMenu) and SMH_KinectRecorderMenu:IsVisible()
+        end,
+        isActive = function() return MGR.Active or MGR.Waiting end,
+        status = function()
+            if MGR.Waiting then return "starting..." end
+            return "recording " .. tostring(MGR.FramesRecorded) .. " / " .. tostring(MGR.FrameCount)
+        end,
+    })
+    return true
+end
 
-hook.Add("Think", "SMH_KinectRecorder_FollowSMH", function()
-
-    if not SMH or not SMH.UI then
-        return
-    end
-
-    local smhOpen = SMH.UI.IsOpen()
-
-    -- SMH just opened
-    if smhOpen and not smhWasOpen then
-
-        smhWasOpen = true
-
-        if OpenKinectRecorderMenu then
-            OpenKinectRecorderMenu()
-        end
-
-    -- SMH just closed
-    elseif not smhOpen and smhWasOpen then
-
-        smhWasOpen = false
-
-        if IsValid(SMH_KinectRecorderMenu) then
-            SMH_KinectRecorderMenu:Close()
-        end
-
-    end
-
-end)
--- ============================================================
--- POSITION RECORDER ABOVE SMH
--- ============================================================
-
-hook.Add("Think", "SMH_KinectRecorder_Position", function()
-
-    if not IsValid(SMH_KinectRecorderMenu) then
-        return
-    end
-
-    if not SMH or not SMH.UI or not SMH.UI.IsOpen() then
-        return
-    end
-
-    local menu = SMH_KinectRecorderMenu
-
-    local width = menu:GetWide()
-    local height = menu:GetTall()
-
-    -- Center the recorder horizontally.
-    local x = (ScrW() - width) / 2
-
-    -- Put it above the SMH timeline.
-    local y = ScrH() - 90 - height - 10
-
-    menu:SetPos(x, y)
-
-end)
+if not RegisterKinectWithHub() then
+    hook.Add("InitPostEntity", "SMH_KinectRecorder_RegisterHub", RegisterKinectWithHub)
+    timer.Simple(2, RegisterKinectWithHub)
+end

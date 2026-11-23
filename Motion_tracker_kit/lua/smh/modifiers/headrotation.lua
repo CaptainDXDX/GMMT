@@ -18,7 +18,8 @@ local function headPhysIndex(entity)
         local bone = entity:LookupBone(name)
         if bone and bone >= 0 then
             local pb = entity:TranslateBoneToPhysBone(bone)
-            if pb and pb >= 0 then return pb end
+            -- exact match only: otherwise a parent body (arm/torso) gets driven
+            if pb and pb >= 0 and entity:TranslatePhysBoneToBone(pb) == bone then return pb end
         end
     end
     for bone = 0, (entity:GetBoneCount() or 0) - 1 do
@@ -29,7 +30,8 @@ local function headPhysIndex(entity)
             and not string.find(name, "headset", 1, true)
             and not string.find(name, "mic", 1, true) then
             local pb = entity:TranslateBoneToPhysBone(bone)
-            if pb and pb >= 0 then return pb end
+            -- exact match only: otherwise a parent body (arm/torso) gets driven
+            if pb and pb >= 0 and entity:TranslatePhysBoneToBone(pb) == bone then return pb end
         end
     end
     return nil
@@ -58,7 +60,7 @@ local function localOffset(entity, off, pb)
             local function loc(v) return (WorldToLocal(v, angle_zero, vector_origin, headAng)) end
             ax = { up = loc(att.Ang:Up()), right = loc(att.Ang:Right()), fwd = loc(att.Ang:Forward()) }
         end
-        axisCache[entity] = ax
+        if ax then axisCache[entity] = ax end
     end
     if not ax then return off end
     local q = Angle(0, 0, 0)

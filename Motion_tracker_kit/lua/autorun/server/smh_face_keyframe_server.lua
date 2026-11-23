@@ -98,7 +98,8 @@ local function headBoneIndex(entity)
         local bone = entity:LookupBone(name)
         if bone and bone >= 0 then
             local pb = entity:TranslateBoneToPhysBone(bone)
-            if pb and pb >= 0 then return bone, pb end
+            -- exact match only: otherwise a parent body (arm/torso) gets driven
+            if pb and pb >= 0 and entity:TranslatePhysBoneToBone(pb) == bone then return bone, pb end
         end
     end
     -- Fallback: any bone named like a head that has its own physics body.
@@ -110,7 +111,8 @@ local function headBoneIndex(entity)
             and not string.find(name, "headset", 1, true)
             and not string.find(name, "mic", 1, true) then
             local pb = entity:TranslateBoneToPhysBone(bone)
-            if pb and pb >= 0 then return bone, pb end
+            -- exact match only: otherwise a parent body (arm/torso) gets driven
+            if pb and pb >= 0 and entity:TranslatePhysBoneToBone(pb) == bone then return bone, pb end
         end
     end
     return nil
@@ -148,9 +150,10 @@ local function headLocalOffset(entity, off, pb)
             local function loc(v) return (WorldToLocal(v, angle_zero, vector_origin, headAng)) end
             ax = { up = loc(att.Ang:Up()), right = loc(att.Ang:Right()), fwd = loc(att.Ang:Forward()) }
         else
-            problem("Head: no 'eyes' attachment found on this model, so head axes are a guess and may move the wrong way.")
+            if not entity.SMHHeadAxisWarned then entity.SMHHeadAxisWarned = true
+            problem("Head: no 'eyes' attachment found on this model, so head axes are a guess and may move the wrong way.") end
         end
-        axisCache[entity] = ax
+        if ax then axisCache[entity] = ax end -- never cache a failed lookup
     end
     if not ax then return off end
     local q = Angle(0, 0, 0)
@@ -387,6 +390,7 @@ net.Receive(HEAD_LIVE_NET, function(_, ply)
                 st.phys:Wake()
             end
             liveHead[entity] = nil
+            axisCache[entity] = nil
             entity.SMHHeadRotationLive = nil
             return
         end

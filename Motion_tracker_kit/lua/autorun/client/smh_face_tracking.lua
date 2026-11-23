@@ -28,6 +28,16 @@ local HEAD_NET      = "SMHFaceTracking_Head"   -- live head preview (handled by 
 local HEAD_DONE_NET = "SMHFaceTracking_HeadOverlayDone"
 local FACE_KEYFRAME_NET = "SMHFaceTracking_CaptureFlexKeyframe"
 local nextHeadNetSend = 0
+local FLEX_LIVE_NET = "SMHFaceTracking_LiveFlex"  -- live flex + eye values for other players (server file smh_face_live_server.lua)
+local nextFlexNetSend = 0
+local PLAYER_HEAD_NET = "SMHFaceTracking_PlayerHead" -- head rotation for player models (server file smh_face_live_server.lua)
+local PLAYER_RELAY_NET = "SMHFaceTracking_PlayerRelay" -- server -> other players: eyes/head of a tracked player model
+local eyeFollow = cookie.GetNumber("smh_face_eye_follow", 1) == 1 -- tick box: tracked eyes drive the eye direction
+local playerFace = {}          -- player -> { eye, eyeT, head, bone, headT, cur } applied just before the player is drawn
+local playerHeadAxes = nil     -- face axes in the head bone's own frame (measured once per Apply)
+local playerHeadWarned = false
+local lastFlexSent = {}
+local flexLiveActive = false
 
 local target = nil
 local mode = "none"            -- "none", "pulse", "sweep" or "live"
@@ -57,6 +67,7 @@ local headPhysBone = nil
 local headPhysObj = nil
 local headPhysOriginalAngle = nil
 local eyeGazeX, eyeGazeY = 0, 0
+local liveEyeVec = nil
 local trackerState = "missing" -- "live", "noface", "stale" or "missing"
 local shownState = ""
 local nextPoll = 0
@@ -356,6 +367,32 @@ local function NormalizeFlexName(name)
     return string.lower(string.gsub(name or "", "[^%w]", ""))
 end
 
+-- Controllers that move BOTH ways around a middle point (mouth/jaw sideways on the Half-Life 2
+-- faces). They must be driven by (right - left), centred in the controller's own range. The
+-- old mapping took max(left, right), which can only ever push to one side, and resting them at
+-- 0 is a full push to one side when the range is 0..1.   { positive source, negative source }
+local SIGNED_FLEXES = {
+    mouthsideways = { "mouthRight", "mouthLeft" },
+    jawsideways   = { "jawRight", "jawLeft" },
+}
+local sidewaysFlip = cookie.GetNumber("smh_face_sideways_flip", 0) == 1
+local sidewaysTrim = cookie.GetNumber("smh_face_sideways_trim", 0) -- nudges the resting point of two-way flexes (-0.5..0.5 of the half range)
+
+-- Which tracker pair drives a two-way flex. Exact known names first, then any flex whose name says
+-- sideways / rightleft / leftright and is about the mouth, lips or jaw (head, eyes and body
+-- controls are left alone).
+local function SignedFor(norm)
+    if SIGNED_FLEXES[norm] then return SIGNED_FLEXES[norm] end
+    if string.find(norm, "sideways", 1, true) or string.find(norm, "rightleft", 1, true)
+        or string.find(norm, "leftright", 1, true) then
+        if string.find(norm, "jaw", 1, true) then return SIGNED_FLEXES.jawsideways end
+        if string.find(norm, "mouth", 1, true) or string.find(norm, "lip", 1, true) then
+            return SIGNED_FLEXES.mouthsideways
+        end
+    end
+    return nil
+end
+
 local NORMALIZED_MAP = {}
 local NORMALIZED_ARKIT_MAP = {}
 local NORMALIZED_ALIASES = {}
@@ -416,12 +453,75 @@ end
 local function ResetFlexes()
     if not IsValid(target) then return end
     for i = 0, target:GetFlexNum() - 1 do
-        target:SetFlexWeight(i, 0)
+        local rest = 0
+        if SignedFor(NormalizeFlexName(target:GetFlexName(i))) then
+            local lo, hi = target:GetFlexBounds(i)
+            rest = ((lo or 0) + (hi or 0)) / 2 + sidewaysTrim * ((hi or 0) - (lo or 0)) / 2 -- the middle of a two-way controller is its neutral
+        end
+        target:SetFlexWeight(i, rest)
     end
+end
+
+-- Player models have no head physics body, so the head is turned with bone manipulation on the
+-- SERVER (which networks it to everyone). The turn is defined by what the head DOES (yaw about
+-- the face's up axis, nod about its right axis, tilt about its forward axis), using the model's
+-- "eyes" attachment, the same way the ragdoll head helper does.
+local function PlayerHeadLocal(off)
+    if not playerHeadAxes then
+        playerHeadAxes = false
+        target:SetupBones()
+        local m = headBone and target:GetBoneMatrix(headBone)
+        local att
+        for _, name in ipairs({ "eyes", "forward", "head", "facial" }) do
+            local id = target:LookupAttachment(name)
+            if id and id > 0 then att = target:GetAttachment(id) if att then break end end
+        end
+        if m and att then
+            local headAng = m:GetAngles()
+            local function loc(v) return (WorldToLocal(v, angle_zero, vector_origin, headAng)) end
+            playerHeadAxes = { up = loc(att.Ang:Up()), right = loc(att.Ang:Right()), fwd = loc(att.Ang:Forward()) }
+        elseif not playerHeadWarned then
+            playerHeadWarned = true
+            print("[SMH Face] No 'eyes' attachment on this player model: head axes are a guess and may move the wrong way.")
+        end
+    end
+    if not playerHeadAxes then return off end
+    local q = Angle(0, 0, 0)
+    q:RotateAroundAxis(playerHeadAxes.up, off.y)
+    q:RotateAroundAxis(playerHeadAxes.right, off.p)
+    q:RotateAroundAxis(playerHeadAxes.fwd, off.r)
+    return q
+end
+
+local function SetPlayerFace(ply, key, a, b)
+    local d = playerFace[ply]
+    if not d then d = { cur = Angle(0, 0, 0) } playerFace[ply] = d end
+    local now = RealTime()
+    if key == "eye" then d.eye, d.eyeT = a, a and now or nil
+    elseif key == "head" then d.head, d.bone, d.headT = a, b, a and now or nil end
 end
 
 local function SendHeadRotation(active, ang)
     if not IsValid(target) then return end
+    if target == LocalPlayer() then
+        if active and CurTime() < nextHeadNetSend then return end
+        if active then nextHeadNetSend = CurTime() + 1 / 20 end
+        if util.NetworkStringToID(PLAYER_HEAD_NET) == 0 then
+            -- no server file: still show it on your own model
+            SetPlayerFace(target, "head", active and PlayerHeadLocal(ang or angle_zero) or nil, headBone)
+            return
+        end
+        local m = active and PlayerHeadLocal(ang or angle_zero) or nil
+        SetPlayerFace(target, "head", m, headBone) -- applied to your own model right here
+        net.Start(PLAYER_HEAD_NET)
+        net.WriteBool(active and true or false)
+        if active then
+            net.WriteUInt(headBone or 0, 10)
+            net.WriteAngle(m)
+        end
+        net.SendToServer()
+        return
+    end
     -- Limit active pose updates to about 30 Hz; always allow reset/test messages through.
     if active and CurTime() < nextHeadNetSend then return end
     if active then nextHeadNetSend = CurTime() + (1 / 60) end
@@ -429,6 +529,49 @@ local function SendHeadRotation(active, ang)
     net.WriteEntity(target)
     net.WriteBool(active and true or false)
     net.WriteAngle(ang or angle_zero)
+    net.SendToServer()
+end
+
+-- Multiplayer: the flex weights set on this client are only seen by you. Send them to the
+-- server (about 20 times a second, only when something changed) so it applies them to the
+-- entity and every player sees the face. Called with active=false when tracking stops.
+local function SendLiveFace(active, eyeVec)
+    if not IsValid(target) then return end
+    if util.NetworkStringToID(FLEX_LIVE_NET) == 0 then return end -- server file not installed: stay local-only
+    if not active then
+        if flexLiveActive then
+            flexLiveActive = false
+            lastFlexSent = {}
+            net.Start(FLEX_LIVE_NET)
+            net.WriteEntity(target)
+            net.WriteBool(false)
+            net.SendToServer()
+        end
+        return
+    end
+    if CurTime() < nextFlexNetSend then return end
+    local count = target:GetFlexNum()
+    if count <= 0 or count > 1000 then return end
+    local changed = not flexLiveActive
+    if not changed then
+        for i = 0, count - 1 do
+            if math.abs((target:GetFlexWeight(i) or 0) - (lastFlexSent[i] or 0)) > 0.004 then changed = true break end
+        end
+    end
+    if not changed then return end
+    nextFlexNetSend = CurTime() + 1 / 20
+    flexLiveActive = true
+    net.Start(FLEX_LIVE_NET)
+    net.WriteEntity(target)
+    net.WriteBool(true)
+    net.WriteUInt(count, 10)
+    for i = 0, count - 1 do
+        local w = target:GetFlexWeight(i) or 0
+        lastFlexSent[i] = w
+        net.WriteFloat(w)
+    end
+    net.WriteBool(eyeVec ~= nil)
+    if eyeVec then net.WriteVector(eyeVec) end
     net.SendToServer()
 end
 
@@ -495,7 +638,7 @@ local function ResetHeadRotation()
     -- The actual prop_ragdoll physics objects are managed by the server.
     -- Ask the server helper to restore the original head-physics angle.
     SendHeadRotation(false, angle_zero)
-    if IsValid(target) and headBone ~= nil and headBone >= 0 then
+    if IsValid(target) and target ~= LocalPlayer() and headBone ~= nil and headBone >= 0 then
         target:ManipulateBoneAngles(headBone, headBoneOriginal or angle_zero)
     end
 end
@@ -554,9 +697,11 @@ end
 local function StopTest()
     mode = "none"
     sweepIndex = -1
+    SendLiveFace(false)
     ResetFlexes()
     if IsValid(target) and target.SetEyeTarget then
         target:SetEyeTarget(vector_origin)
+        if target == LocalPlayer() then SetPlayerFace(target, "eye", nil) end
     end
     ResetHeadRotation()
     eyeGazeX, eyeGazeY = 0, 0
@@ -571,10 +716,18 @@ local function Side(name)
     return s
 end
 
--- One tracker value, with the neutral face removed, scaled to 0..1
-local function ShapeValue(name)
+-- Channels that read lopsided on a relaxed face (the tracker often reports one eye squinting or
+-- one lip corner pressed). Each left/right pair is blended toward its average by this much.
+-- 1 = fully the same on both sides. Winks and one-sided brow/smile moves are NOT in this list.
+local SYMMETRIC = {
+    eyeSquint = 1.0, mouthPress = 1.0, mouthStretch = 0.8, mouthDimple = 0.8,
+    cheekSquint = 0.8, noseSneer = 0.6, mouthRollLower = 0.5, mouthRollUpper = 0.5,
+}
+local symStrength = cookie.GetNumber("smh_face_symmetry", 1)
+
+-- One tracker value, with the neutral face removed, scaled to 0..1 (no symmetry blending)
+local function UsedValue(key)
     if not latest then return 0 end
-    local key = Side(name)
     local source = smoothedShapes or latest
     local v = source[key] or 0
     local n = neutral[key] or 0
@@ -587,6 +740,21 @@ local function ShapeValue(name)
     end
     local denom = math.max(top - n, 0.1)
     return math.Clamp((v - n) / denom, 0, 1)
+end
+
+local function ShapeValue(name)
+    if not latest then return 0 end
+    local key = Side(name)
+    local v = UsedValue(key)
+    local base, side = string.match(key, "^(.-)(Left)$")
+    if not base then base, side = string.match(key, "^(.-)(Right)$") end
+    local w = base and SYMMETRIC[base]
+    if w and symStrength > 0 then
+        local other = base .. (side == "Left" and "Right" or "Left")
+        w = w * symStrength
+        v = v * (1 - w) + (v + UsedValue(other)) * 0.5 * w
+    end
+    return v
 end
 
 
@@ -869,12 +1037,19 @@ local function BuildLiveFlexes()
         local normalizedName = NormalizeFlexName(name)
         local effectiveBase = EffectivePoseBase()
         local formula = (effectiveBase == "tf2_hwm") and NORMALIZED_HWM_FORMULAS[normalizedName] or nil
+        if string.find(normalizedName, "side", 1, true) or string.find(normalizedName, "rightleft", 1, true)
+            or string.find(normalizedName, "leftright", 1, true) then
+            local lo, hi = target:GetFlexBounds(i)
+            print(string.format("[SMH Face] Sideways-type flex %d '%s': range %.2f..%.2f, weight now %+.2f, handled as two-way: %s",
+                i, tostring(name), lo or 0, hi or 0, target:GetFlexWeight(i) or 0, tostring(SignedFor(normalizedName) ~= nil)))
+        end
         local entry = name and MAP[name]
             or NORMALIZED_MAP[normalizedName]
             or ARKIT_MAP[name]
             or NORMALIZED_ARKIT_MAP[normalizedName]
             or NORMALIZED_ALIASES[normalizedName]
-        if entry or formula then
+        local signed = (not formula) and SignedFor(normalizedName) or nil
+        if entry or formula or signed then
             local settings = flexProfile[name]
             if not istable(settings) then
                 settings = { gain = 1, muted = false }
@@ -884,11 +1059,15 @@ local function BuildLiveFlexes()
             settings.muted = settings.muted == true
 
             local minB, maxB = target:GetFlexBounds(i)
+            if signed then
+                print(string.format("[SMH Face] Two-way flex '%s': range %.2f..%.2f, neutral at %.2f", tostring(name), minB, maxB, (minB + maxB) / 2))
+            end
             liveFlexes[#liveFlexes + 1] = {
                 idx = i,
                 name = name or ("flex_" .. i),
                 sources = entry or {},
                 formula = formula,
+                signed = signed,
                 min = minB,
                 max = maxB,
                 value = 0,
@@ -922,8 +1101,8 @@ local function UpdateLiveStatus()
     SetStatus("Live: " .. #liveFlexes .. " flexes driven.\n" .. text)
 end
 
-local function ApplyFaceTracking()
-    local ent = GetSMHEntity()
+local function ApplyFaceTracking(forcedEnt)
+    local ent = forcedEnt or GetSMHEntity()
     if not ent then
         SetStatus("No SMH entity selected.\nSelect one in Stop Motion Helper first.")
         return
@@ -936,6 +1115,14 @@ local function ApplyFaceTracking()
     end
 
     StopTest()
+    -- Release the head of the PREVIOUS model on the server first, otherwise its
+    -- stale live-head state keeps being applied after switching characters.
+    if IsValid(target) and target ~= ent then
+        SendHeadRotation(false, angle_zero)
+        if headBone ~= nil and headBone >= 0 then
+            target:ManipulateBoneAngles(headBone, headBoneOriginal or angle_zero)
+        end
+    end
     target = ent
     headBone = nil
     for _, name in ipairs({ "ValveBiped.Bip01_Head1", "bip_head", "Bip01_Head", "Bip01 Head", "Head", "head" }) do
@@ -953,6 +1140,8 @@ local function ApplyFaceTracking()
         end
     end
     headBoneOriginal = (headBone ~= nil and headBone >= 0) and target:GetManipulateBoneAngles(headBone) or angle_zero
+    playerHeadAxes = nil
+    playerHeadWarned = false
     -- Client-side ragdolls may report zero physics objects; the server helper resolves these.
     headPhysBone = nil
     headPhysObj = nil
@@ -1192,7 +1381,12 @@ hook.Add("Think", "SMHFaceTracking_Think", function()
         local alpha = rawInput and 1 or (1 - math.exp(-SMOOTH_RATE * dt))
         for _, f in ipairs(liveFlexes) do
             local goal = 0
-            if f.formula then
+            if f.signed then
+                local mid, half = (f.min + f.max) / 2, (f.max - f.min) / 2
+                local dir = SV(f.signed[1]) - SV(f.signed[2])
+                if sidewaysFlip then dir = -dir end
+                goal = f.muted and mid or (mid + (dir * strength * f.gain + sidewaysTrim) * half)
+            elseif f.formula then
                 goal = f.formula()
             else
                 -- Ordinary aliases use the strongest relevant source. HWM
@@ -1202,7 +1396,9 @@ hook.Add("Think", "SMHFaceTracking_Think", function()
                     if v > goal then goal = v end
                 end
             end
-            if f.muted then
+            if f.signed then
+                -- already centred and scaled above
+            elseif f.muted then
                 goal = f.min
             else
                 -- Preserve centered HWM defaults: apply tracking around 0.5
@@ -1221,7 +1417,7 @@ hook.Add("Think", "SMHFaceTracking_Think", function()
 
         -- Eye direction is separate from facial flexes. The Eye target SMH
         -- modifier can record this target for timeline playback.
-        if target.SetEyeTarget and latestGaze then
+        if eyeFollow and target.SetEyeTarget and latestGaze then
             -- Invert both axes: current user test reports gaze is mirrored.
             local gx = -math.Clamp((tonumber(latestGaze.x) or 0) - (neutralGaze.x or 0), -1, 1)
             local gy = -math.Clamp((tonumber(latestGaze.y) or 0) - (neutralGaze.y or 0), -1, 1)
@@ -1229,11 +1425,19 @@ hook.Add("Think", "SMHFaceTracking_Think", function()
             eyeGazeY = eyeGazeY + (gy - eyeGazeY) * alpha
             -- Match Garry's Mod's Eye Poser convention: pitch/yaw angles
             -- converted to a long local-space direction from the eye attachment.
-            target:SetEyeTarget(EyeVectorFor(eyeGazeX, eyeGazeY))
-        elseif target.SetEyeTarget then
+            liveEyeVec = EyeVectorFor(eyeGazeX, eyeGazeY)
+            target:SetEyeTarget(liveEyeVec)
+        elseif eyeFollow and target.SetEyeTarget then
             target:SetEyeTarget(vector_origin)
             eyeGazeX, eyeGazeY = 0, 0
+            liveEyeVec = nil
+        else
+            liveEyeVec = nil -- eye following is off: leave the model's own eyes alone
         end
+        if target == LocalPlayer() then SetPlayerFace(target, "eye", liveEyeVec) end
+
+        -- Share the face with other players (server applies it to the entity).
+        SendLiveFace(true, liveEyeVec)
 
         -- Send webcam head pose to the server-side ragdoll physics helper.
         -- This drives the visible ragdoll head live; it is not recorded to SMH.
@@ -1421,9 +1625,9 @@ local function OpenMenu()
     frame:SetPos(20, math.min(80, math.max(10, ScrH() - frameH - 20)))
     frame:DockPadding(10, 34, 10, 10)
     frame:MakePopup()
-    frame.OnClose = function()
-        StopTest()
-    end
+    -- Closing only hides the window: live tracking keeps running (the hub's
+    -- status list shows it). Use the Stop button in the window to end tracking.
+    frame:SetDeleteOnClose(false)
 
     local content = vgui.Create("DScrollPanel", frame)
     content:Dock(FILL)
@@ -1435,7 +1639,35 @@ local function OpenMenu()
     statusLabel:SetText("Select an entity in SMH, then press Apply Face Tracking.")
 
     -- Main steps, in the order you use them.
-    AddButton(content, "Apply Face Tracking", ApplyFaceTracking)
+    AddButton(content, "Apply Face Tracking", function() ApplyFaceTracking() end)
+    AddButton(content, "Apply to MY player model", function()
+        local me = LocalPlayer()
+        if IsValid(me) then ApplyFaceTracking(me) end
+    end)
+
+    -- Admins choose who may share live face tracking with the whole server.
+    if IsValid(LocalPlayer()) and LocalPlayer():IsAdmin() then
+        local modeLabel = vgui.Create("DLabel", content)
+        modeLabel:Dock(TOP)
+        modeLabel:SetText("Server face sharing (admin):")
+        modeLabel:SetTall(18)
+        local combo = vgui.Create("DComboBox", content)
+        combo:Dock(TOP)
+        combo:SetTall(26)
+        combo:DockMargin(0, 0, 0, 6)
+        combo:AddChoice("Off", 0)
+        combo:AddChoice("Admins only", 1)
+        combo:AddChoice("Everyone", 2)
+        local cv = GetConVar("smh_face_live_mode")
+        if cv then
+            combo:ChooseOptionID(math.Clamp(cv:GetInt(), 0, 2) + 1)
+        else
+            combo:SetValue("(server file not installed)")
+        end
+        combo.OnSelect = function(_, _, _, data)
+            RunConsoleCommand("smh_face_live_mode_set", tostring(data))
+        end
+    end
 
     local liveButton = AddButton(content, "Start Live Tracking", function()
         if mode == "live" then
@@ -1499,6 +1731,62 @@ local function OpenMenu()
         strength = val
     end
 
+    local eyeToggle = vgui.Create("DCheckBoxLabel", content)
+    eyeToggle:SetText("Follow tracked eye direction")
+    eyeToggle:SetTooltip("Eyes look where you look. Untick to leave the model's own eyes alone.")
+    eyeToggle:SetValue(eyeFollow and 1 or 0)
+    eyeToggle:Dock(TOP)
+    eyeToggle:DockMargin(0, 0, 0, 8)
+    eyeToggle.OnChange = function(_, val)
+        eyeFollow = val and true or false
+        cookie.Set("smh_face_eye_follow", eyeFollow and "1" or "0")
+        if not eyeFollow and IsValid(target) then
+            if target.SetEyeTarget then target:SetEyeTarget(vector_origin) end
+            if target == LocalPlayer() then SetPlayerFace(target, "eye", nil) end
+        end
+    end
+
+    local sideToggle = vgui.Create("DCheckBoxLabel", content)
+    sideToggle:SetText("Flip mouth/jaw sideways direction")
+    sideToggle:SetTooltip("Half-Life rigs: untick/tick if the mouth slides the opposite way to yours.")
+    sideToggle:SetValue(sidewaysFlip and 1 or 0)
+    sideToggle:Dock(TOP)
+    sideToggle:DockMargin(0, 0, 0, 8)
+    sideToggle.OnChange = function(_, val)
+        sidewaysFlip = val and true or false
+        cookie.Set("smh_face_sideways_flip", sidewaysFlip and "1" or "0")
+    end
+
+    local symSlider = vgui.Create("DNumSlider", content)
+    symSlider:Dock(TOP)
+    symSlider:SetTall(30)
+    symSlider:DockMargin(0, 0, 0, 6)
+    symSlider:SetText("Face symmetry")
+    symSlider:SetTooltip("Evens out squint, lip press, stretch and dimple between the left and right side. Fixes lopsided faces on a relaxed expression. 0 = off.")
+    symSlider:SetMin(0)
+    symSlider:SetMax(1)
+    symSlider:SetDecimals(2)
+    symSlider:SetValue(symStrength)
+    symSlider.OnValueChanged = function(_, val)
+        symStrength = math.Clamp(tonumber(val) or 1, 0, 1)
+        cookie.Set("smh_face_symmetry", tostring(symStrength))
+    end
+
+    local trimSlider = vgui.Create("DNumSlider", content)
+    trimSlider:Dock(TOP)
+    trimSlider:SetTall(30)
+    trimSlider:DockMargin(0, 0, 0, 6)
+    trimSlider:SetText("Mouth sideways centre")
+    trimSlider:SetTooltip("Nudges where the mouth rests left/right on Half-Life rigs. 0 = the exact middle (0.50).")
+    trimSlider:SetMin(-0.5)
+    trimSlider:SetMax(0.5)
+    trimSlider:SetDecimals(2)
+    trimSlider:SetValue(sidewaysTrim)
+    trimSlider.OnValueChanged = function(_, val)
+        sidewaysTrim = math.Clamp(tonumber(val) or 0, -0.5, 0.5)
+        cookie.Set("smh_face_sideways_trim", tostring(sidewaysTrim))
+    end
+
     local overlayToggle = vgui.Create("DCheckBoxLabel", content)
     overlayToggle:SetText("Show live tracking overlay in-game")
     overlayToggle:SetTooltip("Shows what is being tracked in the corner of the screen.")
@@ -1510,13 +1798,14 @@ local function OpenMenu()
     end
 
     local headToggle = vgui.Create("DCheckBoxLabel", content)
-    headToggle:SetText("Show head movement live on the model (preview)")
-    headToggle:SetTooltip("Rotates the model's head while you track. To RECORD the head, use the option in Record Tracked Face.")
+    headToggle:SetText("Capture head movement")
+    headToggle:SetTooltip("Rotates the model's head live while you track, and records it too when you record. Best: tick 'Head rotation' on a timeline in SMH.")
     headToggle:SetValue(headTrackingEnabled and 1 or 0)
     headToggle:Dock(TOP)
     headToggle:DockMargin(0, 0, 0, 8)
     headToggle.OnChange = function(_, val)
         headTrackingEnabled = val and true or false
+        FaceRec.headOverlay = headTrackingEnabled
         if not headTrackingEnabled then ResetHeadRotation() end
         if headTrackingEnabled and (headBone == nil or headBone < 0) then
             SetStatus("Head tracking enabled, but no head bone was found on this model. Press Apply Face Tracking first, then try again.")
@@ -1624,48 +1913,34 @@ end)
 
 concommand.Add("smh_face_menu", OpenMenu)
 
--- Follow the Stop Motion Helper UI, like the Kinect recorder does.
--- The face panel is created when SMH opens, starts minimized, and closes when
--- SMH closes. It no longer opens by itself when the game starts. The user can
--- restore it from the taskbar/title bar or use smh_face_menu at any time.
-local smhFaceWasOpen = false
-local smhFacePanelAutoMinimize = false
-
-local function IsSMHMenuOpen()
-    return SMH ~= nil
-        and SMH.UI ~= nil
-        and isfunction(SMH.UI.IsOpen)
-        and SMH.UI.IsOpen() == true
+-- Hub registration: the face windows are opened from the button strip above the
+-- SMH timeline (or smh_face_menu). They no longer open/close with SMH.
+local function RegisterFaceWithHub()
+    if not (SMHToolsHub and SMHToolsHub.Register) then return false end
+    SMHToolsHub.Register({
+        id = "face_tracking",
+        name = "Face Tracking",
+        open = function() OpenMenu() end,
+        close = function() if IsValid(frame) then frame:Close() end end,
+        isOpen = function() return IsValid(frame) and frame:IsVisible() end,
+        isActive = function() return mode == "live" and FaceRec.phase == "idle" end,
+        status = function() return headTrackingEnabled and "live (head on)" or "live" end,
+    })
+    SMHToolsHub.Register({
+        id = "face_recorder",
+        name = "Face Recorder",
+        open = function() FaceRec.OpenWindow() end,
+        close = function() if IsValid(FaceRec.window) then FaceRec.window:Close() end end,
+        isOpen = function() return IsValid(FaceRec.window) and FaceRec.window:IsVisible() end,
+        isActive = function() return FaceRec.phase ~= "idle" end,
+        status = function() return tostring(FaceRec.phase) end,
+    })
+    return true
 end
-
-hook.Add("Think", "SMH_FaceTracking_FollowSMH", function()
-    local smhOpen = IsSMHMenuOpen()
-
-    if smhOpen and not smhFaceWasOpen then
-        smhFaceWasOpen = true
-        smhFacePanelAutoMinimize = true
-
-        if not IsValid(frame) then
-            OpenMenu()
-        else
-            frame:SetVisible(true)
-        end
-
-        -- Minimize after the panel has been created/shown so it does not cover
-        -- the SMH timeline or the Kinect recorder window.
-        timer.Simple(0, function()
-            if IsValid(frame) and frame.SetMinimized then
-                frame:SetMinimized(true)
-            end
-        end)
-
-    elseif not smhOpen and smhFaceWasOpen then
-        smhFaceWasOpen = false
-        if IsValid(frame) and FaceRec.phase == "idle" then
-            frame:Close()
-        end
-    end
-end)
+if not RegisterFaceWithHub() then
+    hook.Add("InitPostEntity", "SMH_FaceTracking_RegisterHub", RegisterFaceWithHub)
+    timer.Simple(2, RegisterFaceWithHub)
+end
 
 -- ===========================================================================
 -- Record Tracked Face
@@ -1727,11 +2002,7 @@ function FaceRec.ShowUI()
     local smhOpen = SMH ~= nil and SMH.UI ~= nil and isfunction(SMH.UI.IsOpen) and SMH.UI.IsOpen() == true
     for _, p in ipairs(FaceRec.hidden) do
         if IsValid(p) then
-            if p == frame and not smhOpen then
-                p:Close() -- same as the follow-SMH behaviour: no SMH menu, no face panel
-            else
-                p:SetVisible(true)
-            end
+            p:SetVisible(true)
         end
     end
     FaceRec.hidden = {}
@@ -1805,6 +2076,7 @@ function FaceRec.Start()
     end
     if mode ~= "live" then StartLive() end
 
+    FaceRec.headOverlay = headTrackingEnabled
     FaceRec.usedOverlay = FaceRec.headOverlay
     FaceRec.buffer = {}
     FaceRec.lost = 0
@@ -2105,7 +2377,7 @@ function FaceRec.DrawOverlay()
     else
         line1 = "Calibration: " .. (next(calibHi) ~= nil and "done" or "not done (press Calibrate Face)")
         line2 = FaceRec.headOverlay and ("Head is recorded onto timeline " .. FaceRec.headTimeline)
-            or (headTrackingEnabled and "Head is a live preview only (not recorded)" or "")
+            or (headTrackingEnabled and "Head capture is off" or "")
     end
 
     local W = 300
@@ -2315,14 +2587,6 @@ function FaceRec.OpenWindow()
         "Webcam tracking arrives slightly late. Raise this to shift the recorded face earlier on the timeline.",
         function(v) FaceRec.latency = math.Clamp(math.floor(v + 0.5), 0, 10) end)
 
-    local headCheck = vgui.Create("DCheckBoxLabel", content)
-    headCheck:SetText("Record head movement")
-    headCheck:SetTooltip("Records the tracked head rotation. Best: tick 'Head rotation' on the timeline below in SMH, so the head is its own timeline layered over any body animation. If that is not ticked, the older method is used: it adds the head to the existing physics-bone keyframes of that timeline.")
-    headCheck:SetValue(FaceRec.headOverlay and 1 or 0)
-    headCheck:Dock(TOP)
-    headCheck:DockMargin(0, 4, 0, 4)
-    headCheck.OnChange = function(_, v) FaceRec.headOverlay = v and true or false end
-
     AddSlider("Head timeline", 1, 10, 0, FaceRec.headTimeline,
         "The timeline that has 'Head rotation' ticked in SMH (it can be the same as the face timeline or a separate one). Without that, the older method needs an existing timeline with Physics bones.",
         function(v) FaceRec.headTimeline = math.Clamp(math.floor(v + 0.5), 1, 10) end)
@@ -2395,10 +2659,64 @@ concommand.Add("smh_face_flexes", function()
     end
     print("[SMH Face] " .. ent:GetModel() .. " has " .. ent:GetFlexNum() .. " flexes:")
     for i = 0, ent:GetFlexNum() - 1 do
-        print("  " .. i .. ": " .. (ent:GetFlexName(i) or "?"))
+        local lo, hi = ent:GetFlexBounds(i)
+        print(string.format("  %2d: %-26s range %.2f..%.2f  weight %+.2f", i, ent:GetFlexName(i) or "?", lo or 0, hi or 0, ent:GetFlexWeight(i) or 0))
     end
 end)
 
+
+-- Diagnostic for "mouth pulled to one side": run it while live tracking with a RELAXED face.
+-- Prints the tracker's mouth values (raw, neutral, used), every flex that is not at rest, and
+-- left/right pairs that disagree. Copy the whole [SMH Face Audit] block to Claude.
+concommand.Add("smh_face_audit", function()
+    local P = function(t) print("[SMH Face Audit] " .. t) end
+    if not IsValid(target) then P("Press Apply Face Tracking first.") return end
+    P("model " .. tostring(target:GetModel()) .. "  mode " .. mode .. "  tracker " .. tostring(trackerState) ..
+        "  base " .. tostring(EffectivePoseBase()))
+    P("neutral face saved: " .. tostring(next(neutral) ~= nil) .. "   range calibrated: " .. tostring(next(calibHi) ~= nil) ..
+        "   swap sides: " .. tostring(swapSides) .. "   strength: " .. tostring(strength))
+    if not latest then P("No tracker data right now (start Live Tracking with the tracker running).") end
+    for _, k in ipairs({ "mouthLeft", "mouthRight", "mouthSmileLeft", "mouthSmileRight", "mouthFrownLeft", "mouthFrownRight",
+        "mouthStretchLeft", "mouthStretchRight", "mouthPressLeft", "mouthPressRight", "mouthLowerDownLeft", "mouthLowerDownRight",
+        "mouthUpperUpLeft", "mouthUpperUpRight", "mouthDimpleLeft", "mouthDimpleRight", "jawLeft", "jawRight", "jawOpen",
+        "mouthClose", "mouthPucker", "mouthFunnel", "mouthRollLower", "mouthRollUpper", "mouthShrugLower", "mouthShrugUpper",
+        "eyeSquintLeft", "eyeSquintRight", "browOuterUpLeft", "browOuterUpRight", "cheekSquintLeft", "cheekSquintRight" }) do
+        local raw = latest and latest[k] or 0
+        P(string.format("shape %-18s raw %.2f  neutral %.2f  used %.2f", k, tonumber(raw) or 0, neutral[k] or 0, ShapeValue(k)))
+    end
+    local driven = {}
+    for _, f in ipairs(liveFlexes) do driven[f.idx] = f end
+    for i = 0, target:GetFlexNum() - 1 do
+        local w = target:GetFlexWeight(i) or 0
+        local lo, hi = target:GetFlexBounds(i)
+        if math.abs(w) > 0.03 then
+            local f = driven[i]
+            P(string.format("flex %2d %-24s weight %+.2f  range %.2f..%.2f  %s%s", i, tostring(target:GetFlexName(i)), w, lo, hi,
+                f and "driven" or "NOT driven", f and f.sources and #f.sources > 0 and (" by " .. table.concat(f.sources, "+")) or ""))
+        end
+    end
+    for i = 0, target:GetFlexNum() - 1 do
+        local nm = tostring(target:GetFlexName(i))
+        local norm = NormalizeFlexName(nm)
+        if string.find(norm, "side", 1, true) or string.find(norm, "rightleft", 1, true) or string.find(norm, "leftright", 1, true) then
+            local lo, hi = target:GetFlexBounds(i)
+            local f = driven[i]
+            P(string.format("SIDEWAYS flex %d '%s' range %.2f..%.2f weight %+.3f  driven=%s signed=%s muted=%s gain=%s  flip=%s trim=%.2f",
+                i, nm, lo, hi, target:GetFlexWeight(i) or 0, tostring(f ~= nil), tostring(f and f.signed ~= nil),
+                tostring(f and f.muted), tostring(f and f.gain), tostring(sidewaysFlip), sidewaysTrim))
+        end
+    end
+    local byName = {}
+    for _, f in ipairs(liveFlexes) do byName[f.name] = f end
+    for name, f in pairs(byName) do
+        local other = string.match(name, "^right_(.+)$")
+        local l = other and byName["left_" .. other]
+        if l and math.abs(f.value - l.value) > 0.05 then
+            P(string.format("pair right_%s %.2f  vs  left_%s %.2f  (differ by %.2f)", other, f.value, other, l.value, math.abs(f.value - l.value)))
+        end
+    end
+    P("end of audit")
+end)
 
 concommand.Add("smh_face_profile", function()
     if not IsValid(target) then
@@ -2417,3 +2735,54 @@ concommand.Add("smh_face_calibrate_cancel", function() Calib.Cancel("Calibration
 concommand.Add("smh_face_pulse", StartPulse)
 concommand.Add("smh_face_sweep", StartSweep)
 concommand.Add("smh_face_headtest", TestHeadBone)
+
+
+-- ---------------------------------------------------------------------------
+-- Player models: the engine drives a player's eyes and the game animates the head every
+-- frame, so a value set earlier gets overwritten. Apply the tracked eyes and head right
+-- BEFORE the player is drawn instead, for your own model and for other tracked players.
+-- ---------------------------------------------------------------------------
+local FACE_STALE = 1.5
+
+net.Receive(PLAYER_RELAY_NET, function()
+    local ply = net.ReadEntity()
+    local kind = net.ReadUInt(2)   -- 1 = eye, 2 = head, 3 = stop head, 0 = stop eye
+    if not IsValid(ply) or ply == LocalPlayer() then return end
+    if kind == 1 then
+        SetPlayerFace(ply, "eye", net.ReadVector())
+    elseif kind == 2 then
+        local bone = net.ReadUInt(10)
+        SetPlayerFace(ply, "head", net.ReadAngle(), bone)
+    elseif kind == 3 then
+        SetPlayerFace(ply, "head", nil)
+    else
+        SetPlayerFace(ply, "eye", nil)
+    end
+end)
+
+hook.Add("PrePlayerDraw", "SMHFacePlayerApply", function(ply)
+    local d = playerFace[ply]
+    if not d then return end
+    local now = RealTime()
+    if d.eye and now - d.eyeT > FACE_STALE then d.eye = nil end
+    if d.eye then ply:SetEyeTarget(d.eye) end
+
+    local bone = d.bone
+    if d.head and now - d.headT > FACE_STALE then d.head = nil end
+    if bone and bone >= 0 and bone < ply:GetBoneCount() then
+        local goal = d.head or angle_zero
+        d.cur = LerpAngle(math.Clamp(FrameTime() * 20, 0, 1), d.cur, goal)
+        if d.head or d.active then
+            d.active = true
+            local c = d.cur
+            if not d.head and math.abs(c.p) + math.abs(c.y) + math.abs(c.r) < 0.1 then
+                ply:ManipulateBoneAngles(bone, angle_zero) -- eased back to rest: let go of the bone
+                d.cur = Angle(0, 0, 0)
+                d.active = false
+            else
+                ply:ManipulateBoneAngles(bone, c)
+            end
+        end
+    end
+    if not d.eye and not d.head and not d.active then playerFace[ply] = nil end
+end)

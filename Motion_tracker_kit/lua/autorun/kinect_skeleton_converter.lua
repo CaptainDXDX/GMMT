@@ -1,18 +1,14 @@
--- Kinect Skeleton Converter | Clean Rewrite
+-- Kinect Skeleton Converter | v2 (retarget controller)
 --
--- Converts any ragdoll (ValveBiped or not) to work with Garry's Mod's built-in
--- Kinect motion sensor ("Control With Motion Sensor"), with automatic bone
--- detection and a visual manual-mapping editor as a fallback/override.
+-- Lets ANY ragdoll (ValveBiped, TF2, custom rigs) be driven by the Kinect.
+-- Right-click a ragdoll -> "Convert Skeleton" to map its bones and record its
+-- rest pose (press Apply Conversion), then right-click it again ->
+-- "Control with Motion Sensor (converted)".
 --
--- Right-click a ragdoll -> "Convert Skeleton" to open the editor.
---
--- This is a cleaned-up rewrite of an earlier version that had accumulated a
--- lot of experimental retargeting/calibration code which ended up blocking
--- all movement by default. The conversion logic here is the same pattern
--- Valve's own stock ValveBiped Kinect builder uses: a PositionTable and
--- AnglesTable tell the engine which sensor joint drives which physics bone,
--- the engine solves the pose, and Complete() only does small cleanup
--- (spine curve, foot alignment) afterward.
+-- v2 no longer registers a builder with the stock motion controller. It reads
+-- the Kinect joints itself and poses the ragdoll from the rig's own recorded
+-- rest pose (see RETARGET CONTROLLER below), so it does not depend on any
+-- rig's bone axes.
 
 AddCSLuaFile()
 
@@ -233,198 +229,80 @@ else
 end
 
 ------------------------------------------------------------
--- RIG PROFILES (TF2-style rigs: bip_* bones)
+-- RETARGET CONTROLLER (v2)
 --
--- The generic angle tables above assume the ValveBiped bone axes. TF2 /
--- HWM rigs (bip_pelvis, bip_upperArm_L ...) use different local axes, which
--- is why a generic conversion folds them up. GMod ships per-class builders
--- with per-bone axis corrections, but they only match the exact stock model
--- paths and hard-code stock physics indices. The profiles below reproduce
--- those stock per-class tables, mapped by role onto whatever physics bodies
--- the model actually has, and apply to any model whose class can be detected.
+-- Why this exists: Garry's Mod's built-in Kinect support only knows the
+-- ValveBiped skeleton. Older "Kinect-usable" custom models were simply
+-- re-rigged onto the HL2 rig, and an earlier version of this addon tried to
+-- teach the stock controller about every rig (per-class axis tables, builder
+-- registration, ragdoll solver). That meant relying on engine behaviour we
+-- cannot see.
 --
--- Override detection with the server convar kinect_converter_profile:
---   auto (default), generic, scout, spy, soldier, heavy, pyro, demo,
---   medic, engineer, sniper
+-- This version does not use the stock controller at all. It reads the raw
+-- Kinect joints and poses the ragdoll itself, in a way that never needs to
+-- know a rig's bone axes:
+--
+--   1. At Apply time the ragdoll stands in its rest pose. For each of the 15
+--      roles we record how its physics body is rotated relative to a frame
+--      built only from joint POSITIONS (limb direction + a torso hint). We
+--      also record, for EVERY physics body, where it sits relative to its
+--      parent body.
+--   2. Every tick, the same position-only frames are built from the live
+--      Kinect joints. A role's orientation = live frame * recorded offset.
+--   3. Positions come from forward kinematics down the parent chain using the
+--      ragdoll's OWN recorded proportions, so limbs are never stretched and
+--      props/collars/extra bodies simply follow their parent.
+--   4. The result is handed to the ragdoll's build function with every
+--      position and angle set explicitly (no engine "normalize" solver).
+--
+-- Entry points:
+--   Kinect_RegisterRetarget(map, model, fixedHands, ent, swap)   (Apply)
+--   Kinect_Retarget.Start(ent, ply, source, opts) / .Stop(ent)
+--   right-click a ragdoll -> "Control with Motion Sensor (converted)"
+-- Server convars: kinect_converter_scale (36), kinect_converter_smooth (0.5),
+--   kinect_converter_yaw_offset (0), kinect_converter_swap_sides (0)
 ------------------------------------------------------------
 
-if SERVER then CreateConVar("kinect_converter_swap_sides", "0", FCVAR_ARCHIVE, "1 = swap left/right limb roles in Kinect conversions") end
+Kinect_Retarget = Kinect_Retarget or { models = {}, active = {} }
+local RT = Kinect_Retarget
 
-local profileCvar = SERVER and CreateConVar("kinect_converter_profile", "auto", FCVAR_ARCHIVE,
-    "Rig profile for Kinect conversion: auto, generic, scout, spy, soldier, heavy, pyro, demo, medic, engineer, sniper") or nil
+if SERVER then
+    CreateConVar("kinect_converter_swap_sides", "0", FCVAR_ARCHIVE, "1 = swap left/right limb roles in Kinect conversions")
+    CreateConVar("kinect_converter_scale", "36", FCVAR_ARCHIVE, "How far the ragdoll travels per unit the sensor sees")
+    CreateConVar("kinect_converter_smooth", "0.5", FCVAR_ARCHIVE, "Joint smoothing 0 (none) to 0.95 (heavy)")
+    CreateConVar("kinect_converter_yaw_offset", "0", FCVAR_ARCHIVE, "Added to the facing direction; use 180 if the ragdoll faces away from you")
+    CreateConVar("kinect_converter_hand_bend", "1", FCVAR_ARCHIVE, "How much the hands follow the wrist bend the Kinect sees (0 = hands just follow the forearm)")
+    CreateConVar("kinect_converter_extras_mode", "2", FCVAR_ARCHIVE, "What happens to accessory bodies (tie, coat...): 2 = they ragdoll freely (physics), 1 = glued to the nearest driven body, 0 = ordinary bone following")
+    CreateConVar("kinect_converter_pin_extras", "1", FCVAR_ARCHIVE, "1 = glue accessory bodies (ties, coats, scarves, hair...) rigidly to the nearest Kinect-driven body")
+    CreateConVar("kinect_converter_autoground", "1", FCVAR_ARCHIVE, "1 = when control starts, lift the ragdoll if the pose would put it into the floor")
+end
 
-local PROFILE_FAMILY = {
-    scout = "scout", spy = "spy", soldier = "spy",
-    heavy = "common", pyro = "common", demo = "common", medic = "common",
-    engineer = "engineer", sniper = "engineer",
+-- short role key -> canonical role name (the names ROLE_ORDER / the editor use)
+local ROLE_KEY = {
+    PLVS = "ValveBiped.Bip01_Pelvis", SPNE = "ValveBiped.Bip01_Spine4", HEAD = "ValveBiped.Bip01_Head1",
+    RSLD = "ValveBiped.Bip01_R_UpperArm", LSLD = "ValveBiped.Bip01_L_UpperArm",
+    RARM = "ValveBiped.Bip01_R_Forearm", LARM = "ValveBiped.Bip01_L_Forearm",
+    RHND = "ValveBiped.Bip01_R_Hand", LHND = "ValveBiped.Bip01_L_Hand",
+    RTHY = "ValveBiped.Bip01_R_Thigh", LTHY = "ValveBiped.Bip01_L_Thigh",
+    RCLF = "ValveBiped.Bip01_R_Calf", LCLF = "ValveBiped.Bip01_L_Calf",
+    RFOT = "ValveBiped.Bip01_R_Foot", LFOT = "ValveBiped.Bip01_L_Foot",
 }
-
-function Kinect_ChooseProfile(ent)
-    local forced = profileCvar and string.lower(profileCvar:GetString()) or "auto"
-    if forced == "generic" then return nil end
-    if PROFILE_FAMILY[forced] then return forced end
-    if not ent or not IsValid(ent) then return nil end
-    local mdl = string.lower(ent:GetModel() or "")
-    local base = string.match(mdl, "([%w_]+)%.mdl$") or ""
-    local cls = string.match(base, "^bot_(.+)$") or base
-    if cls == "demoman" then cls = "demo" end
-    if PROFILE_FAMILY[cls] then return cls end
-    -- Unknown model but TF2-style bone names: use the most common TF2 layout.
-    if ent:LookupBone("bip_pelvis") and ent:LookupBone("bip_upperArm_L") then return "heavy" end
-    return nil
-end
-
-function Kinect_ApplyProfile(name, B, R, DriveExtras)
-    local family = PROFILE_FAMILY[name]
-    if not family then return end
-    local PLVS, SPNE, RSLD, LSLD = R.PLVS, R.SPNE, R.RSLD, R.LSLD
-    local LARM, LHND, RARM, RHND = R.LARM, R.LHND, R.RARM, R.RHND
-    local RTHY, RCLF, LTHY, LCLF = R.RTHY, R.RCLF, R.LTHY, R.LCLF
-    local HEAD, LFOT, RFOT = R.HEAD, R.LFOT, R.RFOT
-    local S = SENSORBONE
-
-    B.PrePosition = function(self, sensor)
-        if not sensor then return end
-        local spinestretch = (sensor[S.SHOULDER] - sensor[S.SPINE]) * 0.5
-        local acrossshoulders = (sensor[S.SHOULDER_RIGHT] - sensor[S.SHOULDER_LEFT]):GetNormal() * 0.08
-        sensor[S.SHOULDER]:Add(spinestretch * 0.7)
-        sensor[S.SHOULDER_RIGHT]:Add(spinestretch + acrossshoulders)
-        sensor[S.SHOULDER_LEFT]:Add(spinestretch - acrossshoulders)
-        sensor[S.ELBOW_LEFT]:Add(spinestretch - acrossshoulders)
-        sensor[S.ELBOW_RIGHT]:Add(spinestretch + acrossshoulders)
-        sensor[S.WRIST_LEFT]:Add(spinestretch - acrossshoulders)
-        sensor[S.WRIST_RIGHT]:Add(spinestretch + acrossshoulders)
-        sensor[S.HAND_LEFT]:Add(spinestretch - acrossshoulders)
-        sensor[S.HAND_RIGHT]:Add(spinestretch + acrossshoulders)
-        sensor[S.HEAD]:Add(spinestretch * 0.9)
-        local acrosships = (sensor[S.HIP_LEFT] - sensor[S.HIP_RIGHT]):GetNormal() * 0.06
-        sensor[S.HIP_LEFT]:Add(spinestretch * -0.1 + acrosships)
-        sensor[S.HIP_RIGHT]:Add(spinestretch * -0.1 + acrosships * -1)
-        sensor[S.KNEE_LEFT]:Add((sensor[S.KNEE_LEFT] - sensor[S.HIP_LEFT]) * 0.3 + acrosships)
-        sensor[S.KNEE_RIGHT]:Add((sensor[S.KNEE_RIGHT] - sensor[S.HIP_RIGHT]) * 0.3 - acrosships)
-        sensor[S.FOOT_LEFT]:Add((sensor[S.ANKLE_LEFT] - sensor[S.KNEE_LEFT]) * 1.2 + acrosships)
-        sensor[S.FOOT_RIGHT]:Add((sensor[S.ANKLE_RIGHT] - sensor[S.KNEE_RIGHT]) * 1.2 - acrosships)
-        sensor[S.ANKLE_LEFT]:Add((sensor[S.ANKLE_LEFT] - sensor[S.KNEE_LEFT]) * 1.2 + acrosships)
-        sensor[S.ANKLE_RIGHT]:Add((sensor[S.ANKLE_RIGHT] - sensor[S.KNEE_RIGHT]) * 1.2 - acrosships)
-    end
-
-    B.PositionTable = {
-        [PLVS] = S.HIP,
-        [RSLD] = S.SHOULDER_RIGHT, [LSLD] = S.SHOULDER_LEFT,
-        [LARM] = S.ELBOW_LEFT, [LHND] = S.WRIST_LEFT,
-        [RARM] = S.ELBOW_RIGHT, [RHND] = S.WRIST_RIGHT,
-        [LTHY] = S.HIP_LEFT, [RTHY] = S.HIP_RIGHT,
-        [RCLF] = S.KNEE_RIGHT, [LCLF] = S.KNEE_LEFT,
-        [RFOT] = S.ANKLE_RIGHT, [LFOT] = S.ANKLE_LEFT,
-        [HEAD] = S.HEAD,
-        [SPNE] = { type = "lerp", value = 0.8, from = S.SHOULDER, to = S.SPINE },
-    }
-
-    -- Shared torso/head rows (stock TF2).
-    local A = {
-        [PLVS] = { from = PLVS, to = SPNE, up = "hips_back" },
-        [SPNE] = { from = PLVS, to = SPNE, up = "chest_bck" },
-        [HEAD] = { from = SPNE, to = HEAD, up = "head_back" },
-        [RSLD] = { from = RARM, to = RSLD, up_rgt = SPNE },
-        [RARM] = { from = RHND, to = RARM, up_rgt = RSLD },
-        [RHND] = { from_sensor = S.HAND_RIGHT, to_sensor = S.WRIST_RIGHT, up_fwd = RARM },
-        [LSLD] = { from = LARM, to = LSLD, up_lft = SPNE },
-        [LARM] = { from = LHND, to = LARM, up_up = LSLD },
-        [LHND] = { from_sensor = S.WRIST_LEFT, to_sensor = S.HAND_LEFT, up_up = LARM },
-    }
-
-    local function FeetFromCalves(ang, r, l)
-        if ang[RCLF] then ang[RFOT] = ang[RCLF]:Right():AngleEx(ang[RCLF]:Up()) + r end
-        if ang[LCLF] then ang[LFOT] = ang[LCLF]:Right():AngleEx(ang[LCLF]:Up()) + l end
-    end
-    local function Rot(ang, k, axis, deg)
-        if ang[k] then ang[k]:RotateAroundAxis(ang[k][axis](ang[k]), deg) end
-    end
-
-    if family == "scout" then
-        A[LSLD] = { from = LARM, to = LSLD, up_dn = SPNE }
-        A[RTHY] = { from = RCLF, to = RTHY, up = "right" }
-        A[RCLF] = { from = RFOT, to = RCLF, up_up = RTHY }
-        A[LTHY] = { from = LCLF, to = LTHY, up = "forward" }
-        A[LCLF] = { from = LFOT, to = LCLF, up_up = LTHY }
-    elseif family == "spy" then
-        -- Stock spy/soldier drive a TRSO body we may not have; SPNE stands in.
-        A[RARM] = { from = RHND, to = RARM, up_up = RSLD }
-        A[RHND] = { from_sensor = S.HAND_RIGHT, to_sensor = S.WRIST_RIGHT, up_dn = RARM }
-        A[RTHY] = { from = RCLF, to = RTHY, up = "right" }
-        A[RCLF] = { from = RFOT, to = RCLF, up_up = RTHY }
-        A[LTHY] = { from = LCLF, to = LTHY, up = "forward" }
-        A[LCLF] = { from = LFOT, to = LCLF, up_up = LTHY }
-    elseif family == "engineer" then
-        A[RTHY] = { from = RCLF, to = RTHY, up_dn = PLVS }
-        A[RCLF] = { from = RFOT, to = RCLF, up_up = RTHY }
-        A[RFOT] = { from = RCLF, to = RFOT, up_up = RTHY }
-        A[LTHY] = { from = LCLF, to = LTHY, up_dn = PLVS }
-        A[LCLF] = { from = LFOT, to = LCLF, up_up = LTHY }
-        A[LFOT] = { from = LFOT, to = LCLF, up_up = LTHY }
-        if name == "sniper" then A[RCLF] = { from = RFOT, to = RCLF, up_lft = RTHY } end
-        A[RFOT].from, A[RFOT].to = RCLF, RFOT
-    else -- common: heavy / pyro / demo / medic
-        A[RTHY] = { from = RCLF, to = RTHY, up = "right" }
-        A[RCLF] = { from = RFOT, to = RCLF, up_up = RTHY }
-        A[LTHY] = { from = LCLF, to = LTHY, up = "forward" }
-        A[LCLF] = { from = LFOT, to = LCLF, up_up = LTHY }
-    end
-    B.AnglesTable = A
-
-    B.Complete = function(self, player, sensor, rotation, pos, ang)
-        if not pos or not ang then return end
-
-        if family == "scout" or family == "common" then
-            FeetFromCalves(ang, Angle(0, 180, -40), Angle(0, -90, 130))
-        elseif family == "spy" then
-            FeetFromCalves(ang, Angle(0, 90, -70), Angle(0, -90, 110))
-        else
-            Rot(ang, RFOT, "Up", -90); Rot(ang, RFOT, "Forward", 180)
-            Rot(ang, LFOT, "Up", 90);  Rot(ang, LFOT, "Forward", -45)
-            if ang[LFOT] and ang[RFOT] then ang[RFOT]:RotateAroundAxis(ang[LFOT]:Forward(), -45) end
-        end
-
-        Rot(ang, PLVS, "Up", -90)
-        Rot(ang, SPNE, "Up", -90)
-        Rot(ang, HEAD, "Up", -90)
-
-        -- Hands copy the forearm orientation (stock TF2 behavior).
-        if ang[LARM] then
-            ang[LHND] = ang[LARM] * 1
-            Rot(ang, LHND, "Up", 90)
-        end
-        if ang[RARM] then
-            ang[RHND] = ang[RARM] * 1
-            Rot(ang, RHND, "Up", -90)
-            Rot(ang, RHND, "Right", 180)
-        end
-
-        DriveExtras(pos, ang)
-    end
-end
-
-------------------------------------------------------------
--- REST-POSE CALIBRATION
---
--- Instead of trusting any rig's bone-axis conventions, this records, at
--- Apply time, how each physics body is rotated relative to a frame built
--- purely from joint positions (limb direction + a torso-derived roll hint).
--- At runtime the same frame is built from the Kinect joints and the recorded
--- offset is applied on top. It works for any rig because the rig's own axis
--- layout is measured, not assumed. Requires the ragdoll to be in a normal
--- upright pose when Apply is pressed.
---
--- kinect_converter_calibrate (server convar): arms (default), all, off
-------------------------------------------------------------
-
-local calibCvar = SERVER and CreateConVar("kinect_converter_calibrate", "arms", FCVAR_ARCHIVE,
-    "Rest-pose calibration for Kinect conversion: arms, all, off") or nil
-
-local CAL_ARMS = { "RSLD", "LSLD", "RARM", "LARM", "RHND", "LHND" }
-local CAL_REST = { "PLVS", "SPNE", "HEAD", "RTHY", "LTHY", "RCLF", "LCLF", "RFOT", "LFOT" }
 local CAL_ROLES = { "PLVS", "SPNE", "HEAD", "RSLD", "LSLD", "RARM", "LARM", "RHND", "LHND",
                     "RTHY", "LTHY", "RCLF", "LCLF", "RFOT", "LFOT" }
+
+-- sensor joint that marks each role (resolved lazily: SENSORBONE may load later)
+local function RoleJoint(role)
+    local S = SENSORBONE
+    return ({
+        PLVS = S.HIP, SPNE = S.SPINE, HEAD = S.HEAD,
+        RSLD = S.SHOULDER_RIGHT, LSLD = S.SHOULDER_LEFT,
+        RARM = S.ELBOW_RIGHT, LARM = S.ELBOW_LEFT,
+        RHND = S.WRIST_RIGHT, LHND = S.WRIST_LEFT,
+        RTHY = S.HIP_RIGHT, LTHY = S.HIP_LEFT,
+        RCLF = S.KNEE_RIGHT, LCLF = S.KNEE_LEFT,
+        RFOT = S.ANKLE_RIGHT, LFOT = S.ANKLE_LEFT,
+    })[role]
+end
 
 local function CalFrame(f, h, alt)
     if f:LengthSqr() < 1e-10 then return nil end
@@ -435,7 +313,24 @@ local function CalFrame(f, h, alt)
     return f:AngleEx(u:GetNormalized())
 end
 
--- P: role name -> position. Returns role name -> frame angle, or nil.
+-- Wrist bend: turn a forearm frame by the shortest rotation from the forearm direction to the
+-- hand direction (wrist -> hand joint), so the hand can flex and sway at the wrist. The Kinect
+-- cannot see how the hand ROLLS, so roll still follows the forearm. At the rest pose the two
+-- directions match, so the saved offsets are unchanged.
+local function WristBend(frame, forearmDir, handDir, gain)
+    if not frame or forearmDir:LengthSqr() < 1e-8 or handDir:LengthSqr() < 4e-4 then return frame end -- hand joint within 2 cm of the wrist = not really tracked
+    local f, h = forearmDir:GetNormalized(), handDir:GetNormalized()
+    local axis = f:Cross(h)
+    local sinA = axis:Length()
+    if sinA < 1e-3 then return frame end
+    local deg = math.deg(math.atan2(sinA, f:Dot(h))) * gain
+    deg = math.Clamp(deg, 0, 75)
+    local a = Angle(frame.p, frame.y, frame.r)
+    a:RotateAroundAxis(axis / sinA, deg)
+    return a
+end
+
+-- P: role -> position. Returns role -> frame angle (and the torso up vector), or nil.
 local function CalFrames(P)
     for _, k in ipairs(CAL_ROLES) do if not P[k] then return nil end end
     local mid = (P.RSLD + P.LSLD) * 0.5
@@ -457,6 +352,11 @@ local function CalFrames(P)
     out.RARM = CalFrame(P.RHND - P.RARM, back, upT)
     out.LARM = CalFrame(P.LHND - P.LARM, back, upT)
     out.RHND, out.LHND = out.RARM, out.LARM
+    local bendGain = P.HANDBEND or 0
+    if bendGain > 0 and P.RHAND and P.LHAND then
+        out.RHND = WristBend(out.RARM, P.RHND - P.RARM, P.RHAND - P.RHND, bendGain)
+        out.LHND = WristBend(out.LARM, P.LHND - P.LARM, P.LHAND - P.LHND, bendGain)
+    end
     out.RTHY = CalFrame(P.RCLF - P.RTHY, across, back)
     out.LTHY = CalFrame(P.LCLF - P.LTHY, across, back)
     out.RCLF = CalFrame(P.RFOT - P.RCLF, across, back)
@@ -466,385 +366,539 @@ local function CalFrames(P)
     return out, upT
 end
 
--- Returns true if calibration was installed on Builder.
-function Kinect_ApplyCalibration(B, R, ent, mode, DriveExtras)
-    if mode ~= "arms" and mode ~= "all" then return false end
-    if not ent or not IsValid(ent) then return false end
+if SERVER then
 
-    local restP, restA = {}, {}
-    for _, k in ipairs(CAL_ROLES) do
-        local obj = ent:GetPhysicsObjectNum(R[k])
-        if not obj or not IsValid(obj) then
-            print("[Kinect Skeleton] Calibration skipped: missing physics body for", k)
-            return false
+    -- Accessory bodies (ties, coats, scarves, hair...) have no Kinect joint. Left to follow their
+    -- bone parent they can stretch and flop, so they are pinned: re-parented rigidly to the nearest
+    -- Kinect-driven body, which makes them keep their rest pose relative to it (a tie stays on the
+    -- chest). Bone-name fragments below pick them out; add your own with  kinect_converter_pin <word>.
+    local PIN_FILE = "kinect_converter_pins.txt"
+    local PIN_BUILTIN = { "tie", "necktie", "coat", "scarf", "cape", "cloak", "skirt", "hair", "pony", "jiggle",
+        "prp_", "lapel", "flap", "strap", "pouch", "pocket", "tail", "cloth", "dangle", "badge" }
+
+    local function PinFragments()
+        local list = {}
+        for _, w in ipairs(PIN_BUILTIN) do list[#list + 1] = w end
+        local raw = file.Read(PIN_FILE, "DATA")
+        if raw then
+            for line in string.gmatch(raw, "[^\r\n]+") do
+                line = string.lower(string.Trim(line))
+                if line ~= "" then list[#list + 1] = line end
+            end
         end
-        local stored = ent.KinectFrozen and ent.KinectRestPose and ent.KinectRestPose[R[k]]
-        if stored then
-            restP[k], restA[k] = stored.pos, stored.ang
-        else
-            restP[k], restA[k] = obj:GetPos(), obj:GetAngles()
+        return list
+    end
+
+    local function ShouldPin(ent, physIdx, fragments)
+        local bone = ent:TranslatePhysBoneToBone(physIdx)
+        local name = bone and bone >= 0 and string.lower(ent:GetBoneName(bone) or "") or ""
+        if name == "" then return false, "" end
+        for _, w in ipairs(fragments) do
+            -- matches at the start of a word, so "tie" does not catch "attitude"; underscores count as separators
+            local pat = "%f[%a]" .. string.gsub(w, "%p", "%%%0")
+            if w == "tie" or w == "tail" then pat = pat .. "%f[%A]" end -- short words must stand alone
+            if string.find(name, pat) then return true, name end
+            if string.find(w, "_", 1, true) and string.find(name, w, 1, true) then return true, name end
         end
-    end
-    local frames, upT = CalFrames(restP)
-    if not frames then
-        print("[Kinect Skeleton] Calibration skipped: rest pose is degenerate (bodies overlap?)")
-        return false
-    end
-    if upT.z < 0.7 then
-        print("[Kinect Skeleton] WARNING: the ragdoll is not upright right now (torso tilt too large). " ..
-              "Reset the ragdoll to a standing pose and press Apply again, or the calibration will be wrong.")
+        return false, name
     end
 
-    local offset = {}
-    for _, k in ipairs(CAL_ROLES) do
-        local _, la = WorldToLocal(vector_origin, restA[k], vector_origin, frames[k])
-        offset[k] = la
-    end
-
-    local set = {}
-    for _, k in ipairs(CAL_ARMS) do set[#set + 1] = k end
-    if mode == "all" then for _, k in ipairs(CAL_REST) do set[#set + 1] = k end end
-
-    -- Drop the table rows we are replacing so they are not computed twice.
-    for _, k in ipairs(set) do B.AnglesTable[R[k]] = nil end
-
-    local baseComplete = B.Complete
-    B.Complete = function(self, player, sensor, rotation, pos, ang)
-        if baseComplete then baseComplete(self, player, sensor, rotation, pos, ang) end
-        if not pos or not ang then return end
-        local P = {}
-        for _, k in ipairs(CAL_ROLES) do P[k] = pos[R[k]] end
-        local live = CalFrames(P)
-        if not live then return end
-        for _, k in ipairs(set) do
-            local _, a = LocalToWorld(vector_origin, offset[k], vector_origin, live[k])
-            ang[R[k]] = a
-        end
-        DriveExtras(pos, ang)
-    end
-    return true
-end
-
-------------------------------------------------------------
--- BUILDER REGISTRATION
---
--- Registers a Kinect "SkeletonConvertor" (motionsensor builder) for a given
--- model, using the physics-bone mapping in `tbl` (role name -> physics index,
--- as produced by ResolveAnatomicalPhysics or the manual editor below).
---
--- One builder is registered per model name, keyed only by model -- applying
--- a new mapping on the same model replaces the previous builder outright
--- instead of leaving two "_fixed"/"_normal" variants both claiming to be
--- applicable (which made the engine's builder choice arbitrary).
-------------------------------------------------------------
-
-function SetBuilder(tbl, mdl, fixed, ent, swap)
-
-    if not tbl then
-        print("[Kinect Skeleton] ERROR: Bone table is missing.")
-        return
-    end
-
-    if not mdl then
-        print("[Kinect Skeleton] ERROR: Model is missing.")
-        return
-    end
-
-    -- Swap left/right: exchange every paired limb role, so the Kinect's left
-    -- side drives the model's right-side bodies and vice versa. Also forced
-    -- by the server convar kinect_converter_swap_sides.
-    local swapCvar = GetConVar("kinect_converter_swap_sides")
-    if swap or (swapCvar and swapCvar:GetBool()) then
-        local copy = table.Copy(tbl)
-        for _, part in ipairs({ "UpperArm", "Forearm", "Hand", "Thigh", "Calf", "Foot" }) do
-            local l, r = "ValveBiped.Bip01_L_" .. part, "ValveBiped.Bip01_R_" .. part
-            copy[l], copy[r] = tbl[r], tbl[l]
-        end
-        tbl = copy
-        print("[Kinect Skeleton] Left/right swapped for this conversion")
-    end
-
-    --------------------------------------------------------
-    -- PHYSICS BONE INDICES (per role, resolved already)
-    --------------------------------------------------------
-
-    local PLVS = tbl['ValveBiped.Bip01_Pelvis']
-    local SPNE = tbl['ValveBiped.Bip01_Spine4']
-
-    local RSLD = tbl['ValveBiped.Bip01_R_UpperArm']
-    local LSLD = tbl['ValveBiped.Bip01_L_UpperArm']
-
-    local LARM = tbl['ValveBiped.Bip01_L_Forearm']
-    local LHND = tbl['ValveBiped.Bip01_L_Hand']
-
-    local RARM = tbl['ValveBiped.Bip01_R_Forearm']
-    local RHND = tbl['ValveBiped.Bip01_R_Hand']
-
-    local RTHY = tbl['ValveBiped.Bip01_R_Thigh']
-    local RCLF = tbl['ValveBiped.Bip01_R_Calf']
-
-    local HEAD = tbl['ValveBiped.Bip01_Head1']
-
-    local LTHY = tbl['ValveBiped.Bip01_L_Thigh']
-    local LCLF = tbl['ValveBiped.Bip01_L_Calf']
-
-    local LFOT = tbl['ValveBiped.Bip01_L_Foot']
-    local RFOT = tbl['ValveBiped.Bip01_R_Foot']
-
-    --------------------------------------------------------
-    -- VERIFY
-    --------------------------------------------------------
-
-    local requiredBones = {
-        PLVS = PLVS, SPNE = SPNE, RSLD = RSLD, LSLD = LSLD,
-        LARM = LARM, LHND = LHND, RARM = RARM, RHND = RHND,
-        RTHY = RTHY, RCLF = RCLF, HEAD = HEAD, LTHY = LTHY,
-        LCLF = LCLF, LFOT = LFOT, RFOT = RFOT
-    }
-
-    for name, index in pairs(requiredBones) do
-        if index == nil or index < 0 then
-            print("[Kinect Skeleton] ERROR: Invalid physics bone:", name, index)
+    concommand.Add("kinect_converter_pin", function(ply, _, args)
+        if IsValid(ply) and not ply:IsAdmin() then return end
+        local w = string.lower(string.Trim(args[1] or ""))
+        if w == "" then
+            print("Usage: kinect_converter_pin <part of a bone name>   (e.g. kinect_converter_pin tie)\nThen press Apply Conversion again.")
+            local raw = file.Read(PIN_FILE, "DATA")
+            print("Your extra pin words: " .. (raw and string.gsub(string.Trim(raw), "[\r\n]+", ", ") or "(none)"))
+            print("Built in: " .. table.concat(PIN_BUILTIN, ", "))
             return
         end
-    end
+        local raw = file.Read(PIN_FILE, "DATA") or ""
+        file.Write(PIN_FILE, raw .. (raw ~= "" and "\n" or "") .. w)
+        print("[Kinect Skeleton] Bodies whose bone name contains '" .. w .. "' will be pinned. Press Apply Conversion again.")
+    end)
+    concommand.Add("kinect_converter_pin_clear", function(ply)
+        if IsValid(ply) and not ply:IsAdmin() then return end
+        file.Delete(PIN_FILE)
+        print("[Kinect Skeleton] Cleared your extra pin words.")
+    end)
 
-    -- Detect separate collarbone physics bodies (common on HWM rigs, absent
-    -- on stock ValveBiped) between the chest and each shoulder, so they get a
-    -- target instead of being left passive. ent is only used here, once, at
-    -- registration time.
-    local LCOLLAR = ent and FindCollarPhysics(ent, LSLD, SPNE) or nil
-    local RCOLLAR = ent and FindCollarPhysics(ent, RSLD, SPNE) or nil
-    if LCOLLAR then print("[Kinect Skeleton] Found left collarbone physics body:", LCOLLAR, "-- will be driven as a chest/shoulder blend") end
-    if RCOLLAR then print("[Kinect Skeleton] Found right collarbone physics body:", RCOLLAR, "-- will be driven as a chest/shoulder blend") end
+    -- Apply: record the rig's rest pose. Returns true or false, message.
+    function Kinect_RegisterRetarget(tbl, mdl, fixed, ent, swap)
+        if not tbl or not mdl or not IsValid(ent) then return false, "Missing bone table, model or ragdoll" end
 
-    -- Every other physics body that isn't one of the 15 roles (coat panels,
-    -- dogtags, spine_2, ...) would otherwise get no target. Each one is
-    -- attached to its nearest driven ancestor bone: we record where it sits
-    -- relative to that ancestor's physics object right now, and in Complete()
-    -- re-apply the same relative placement to the ancestor's target.
-    local extras = {}
-    if ent and IsValid(ent) then
-        local isRole = {}
-        for _, v in pairs(tbl) do isRole[v] = true end
-        local driven = {}
-        for _, v in pairs(tbl) do driven[v] = true end
-        if LCOLLAR then driven[LCOLLAR] = true end
-        if RCOLLAR then driven[RCOLLAR] = true end
-        local pending = {}
-        for i = 0, ent:GetPhysicsObjectCount() - 1 do
-            if not driven[i] and IsValid(ent:GetPhysicsObjectNum(i)) then pending[#pending + 1] = i end
+        local swapCvar = GetConVar("kinect_converter_swap_sides")
+        if swap or (swapCvar and swapCvar:GetBool()) then
+            local copy = table.Copy(tbl)
+            for _, part in ipairs({ "UpperArm", "Forearm", "Hand", "Thigh", "Calf", "Foot" }) do
+                local l, r = "ValveBiped.Bip01_L_" .. part, "ValveBiped.Bip01_R_" .. part
+                copy[l], copy[r] = tbl[r], tbl[l]
+            end
+            tbl = copy
+            print("[Kinect Skeleton] Left/right swapped for this conversion")
         end
-        local progress = true
-        while #pending > 0 and progress do
-            progress = false
-            for n = #pending, 1, -1 do
-                local i = pending[n]
+
+        local R = {}
+        for _, role in ipairs(CAL_ROLES) do
+            local idx = tbl[ROLE_KEY[role]]
+            if idx == nil or idx < 0 then return false, "Missing physics body for " .. role end
+            R[role] = idx
+        end
+
+        -- rest pose of every physics body (standing pose if the editor froze one)
+        local count = ent:GetPhysicsObjectCount()
+        local restPos, restAng = {}, {}
+        for i = 0, count - 1 do
+            local obj = ent:GetPhysicsObjectNum(i)
+            if IsValid(obj) then
+                local stored = ent.KinectFrozen and ent.KinectRestPose and ent.KinectRestPose[i]
+                if stored then restPos[i], restAng[i] = stored.pos, stored.ang
+                else restPos[i], restAng[i] = obj:GetPos(), obj:GetAngles() end
+            end
+        end
+
+        local restP = {}
+        for _, role in ipairs(CAL_ROLES) do restP[role] = restPos[R[role]] end
+        local frames, upT = CalFrames(restP)
+        if not frames then return false, "Rest pose is degenerate (bodies overlap). Use Stand pose, then Apply." end
+        local warn
+        if upT.z < 0.7 then
+            warn = "The ragdoll was not upright when applied. Use Stand pose first, then Apply again, or the result will be wrong."
+            print("[Kinect Skeleton] WARNING: " .. warn)
+        end
+
+        local offset = {}
+        for _, role in ipairs(CAL_ROLES) do
+            local _, la = WorldToLocal(vector_origin, restAng[R[role]], vector_origin, frames[role])
+            offset[role] = la
+        end
+
+        -- parent of every body = nearest ancestor bone that has its own body
+        local parent = {}
+        for i = 0, count - 1 do
+            if restPos[i] and i ~= R.PLVS then
                 local bone = ent:TranslatePhysBoneToBone(i)
-                local anchor, guard = nil, 0
+                local p, guard = nil, 0
                 bone = bone and ent:GetBoneParent(bone) or -1
                 while bone and bone >= 0 and guard < 64 do
                     guard = guard + 1
                     local ph = ResolveExactPhysicsIndex(ent, bone)
-                    if ph and ph >= 0 and driven[ph] then anchor = ph break end
+                    if ph and ph >= 0 and ph ~= i and restPos[ph] then p = ph break end
                     bone = ent:GetBoneParent(bone)
                 end
-                if anchor then
-                    local ao, eo = ent:GetPhysicsObjectNum(anchor), ent:GetPhysicsObjectNum(i)
-                    local lp, la = WorldToLocal(eo:GetPos(), eo:GetAngles(), ao:GetPos(), ao:GetAngles())
-                    extras[#extras + 1] = { idx = i, anchor = anchor, lp = lp, la = la }
-                    driven[i] = true
-                    table.remove(pending, n)
-                    progress = true
+                parent[i] = p or R.PLVS
+            end
+        end
+        -- pin accessory bodies to the nearest Kinect-driven body (see above)
+        local pinnedNames, freeSeed = {}, {}
+        local modeCvar = GetConVar("kinect_converter_extras_mode")
+        local extrasMode = modeCvar and modeCvar:GetInt() or 2
+        local pinCvar = GetConVar("kinect_converter_pin_extras")
+        if pinCvar and pinCvar:GetBool() and extrasMode > 0 then
+            local fragments = PinFragments()
+            local roleBody = {}
+            for _, idx in pairs(R) do roleBody[idx] = true end
+            for i in pairs(parent) do
+                if not roleBody[i] then
+                    local pin, bname = ShouldPin(ent, i, fragments)
+                    if pin and extrasMode >= 2 then
+                        freeSeed[i] = true
+                        pinnedNames[#pinnedNames + 1] = bname
+                    elseif pin then
+                        local best, bestD
+                        for idx in pairs(roleBody) do
+                            if restPos[idx] then
+                                local d = restPos[i]:DistToSqr(restPos[idx])
+                                if not bestD or d < bestD then best, bestD = idx, d end
+                            end
+                        end
+                        if best then
+                            parent[i] = best
+                            pinnedNames[#pinnedNames + 1] = bname
+                        end
+                    end
                 end
             end
         end
-        if #extras > 0 then print("[Kinect Skeleton] Extra physics bodies attached to their parent bones:", #extras) end
-        if #pending > 0 then print("[Kinect Skeleton] Extra physics bodies left passive (no driven ancestor):", #pending) end
-    end
 
-    local SENSOR_SCALE = 36 -- ragdoll_motion default Scale; sensor units -> world units
-
-    local function DriveExtras(pos, ang)
-        if LCOLLAR and pos[SPNE] and pos[LSLD] and ang[SPNE] and ang[LSLD] then
-            pos[LCOLLAR] = LerpVector(0.5, pos[SPNE], pos[LSLD])
-            ang[LCOLLAR] = LerpAngle(0.5, ang[SPNE], ang[LSLD])
-        end
-        if RCOLLAR and pos[SPNE] and pos[RSLD] and ang[SPNE] and ang[RSLD] then
-            pos[RCOLLAR] = LerpVector(0.5, pos[SPNE], pos[RSLD])
-            ang[RCOLLAR] = LerpAngle(0.5, ang[SPNE], ang[RSLD])
-        end
-        for _, e in ipairs(extras) do
-            if pos[e.anchor] and ang[e.anchor] then
-                local p, a = LocalToWorld(e.lp / SENSOR_SCALE, e.la, pos[e.anchor], ang[e.anchor])
-                pos[e.idx] = p
-                ang[e.idx] = a
+        -- parents before children (anything stuck in a loop hangs off the pelvis)
+        local order, placed = { R.PLVS }, { [R.PLVS] = true }
+        local progress = true
+        while progress do
+            progress = false
+            for i, p in pairs(parent) do
+                if not placed[i] and placed[p] then
+                    order[#order + 1] = i placed[i] = true progress = true
+                end
             end
         end
-    end
-
-    -- Rig profile (see TF2 profiles below). Chosen once, at registration.
-    local profileName = Kinect_ChooseProfile and Kinect_ChooseProfile(ent) or nil
-
-    --------------------------------------------------------
-    -- BUILDER
-    --------------------------------------------------------
-
-    local Builder = {
-
-        -- Nudges the sensor's shoulder/arm/head/hip joints outward from the
-        -- spine before the table-driven solve below, so a stretched-out
-        -- Kinect skeleton doesn't compress the model's torso. Standard
-        -- Kinect-v1 Source-engine adjustment.
-        PrePosition = function(self, sensor)
-            if not sensor then return end
-
-            local spinestretch = (sensor[SENSORBONE.SHOULDER] - sensor[SENSORBONE.SPINE]) * 0.7
-
-            sensor[SENSORBONE.SHOULDER]:Add(spinestretch * 0.7)
-            sensor[SENSORBONE.SHOULDER_RIGHT]:Add(spinestretch)
-            sensor[SENSORBONE.SHOULDER_LEFT]:Add(spinestretch)
-            sensor[SENSORBONE.ELBOW_LEFT]:Add(spinestretch)
-            sensor[SENSORBONE.ELBOW_RIGHT]:Add(spinestretch)
-            sensor[SENSORBONE.WRIST_LEFT]:Add(spinestretch)
-            sensor[SENSORBONE.WRIST_RIGHT]:Add(spinestretch)
-            sensor[SENSORBONE.HAND_LEFT]:Add(spinestretch)
-            sensor[SENSORBONE.HAND_RIGHT]:Add(spinestretch)
-            sensor[SENSORBONE.HEAD]:Add(spinestretch * 0.5)
-            sensor[SENSORBONE.HIP_LEFT]:Add(spinestretch * 0.3)
-            sensor[SENSORBONE.HIP_RIGHT]:Add(spinestretch * 0.3)
-
-            sensor[SENSORBONE.KNEE_RIGHT]:Add(
-                (sensor[SENSORBONE.HIP_RIGHT] - sensor[SENSORBONE.KNEE_RIGHT]) * 0.2
-            )
-            sensor[SENSORBONE.KNEE_LEFT]:Add(
-                (sensor[SENSORBONE.HIP_LEFT] - sensor[SENSORBONE.KNEE_LEFT]) * 0.2
-            )
-        end,
-
-        -- Which sensor joint drives each physics bone's position.
-        PositionTable = {
-            [PLVS] = SENSORBONE.HIP,
-
-            [RSLD] = SENSORBONE.SHOULDER_RIGHT,
-            [LSLD] = SENSORBONE.SHOULDER_LEFT,
-
-            [LARM] = SENSORBONE.ELBOW_LEFT,
-            [LHND] = SENSORBONE.WRIST_LEFT,
-
-            [RARM] = SENSORBONE.ELBOW_RIGHT,
-            [RHND] = SENSORBONE.WRIST_RIGHT,
-
-            [LTHY] = SENSORBONE.HIP_LEFT,
-            [RTHY] = SENSORBONE.HIP_RIGHT,
-
-            [RCLF] = SENSORBONE.KNEE_RIGHT,
-            [LCLF] = SENSORBONE.KNEE_LEFT,
-
-            [RFOT] = SENSORBONE.ANKLE_RIGHT,
-            [LFOT] = SENSORBONE.ANKLE_LEFT,
-
-            [HEAD] = SENSORBONE.HEAD,
-
-            [SPNE] = SENSORBONE.SPINE
-        },
-
-        -- Which sensor joint pair (or physics bone pair) orients each bone,
-        -- and which direction counts as "up" for that bone's basis.
-        AnglesTable = {
-            [PLVS] = { from = LTHY, to = RTHY, up = 'hips_fwd' },
-
-            [SPNE] = { from_sensor = SENSORBONE.HEAD, to_sensor = SENSORBONE.SPINE, up = 'chest_rgt' },
-            [HEAD] = { from_sensor = SENSORBONE.HEAD, to_sensor = SENSORBONE.SHOULDER, up = 'chest_lft' },
-
-            [RSLD] = { from = RARM, to = RSLD, up = 'chest_up' },
-            [LSLD] = { from = LARM, to = LSLD, up = 'chest_dn' },
-
-            [RARM] = { from = RHND, to = RARM, up_up = RSLD },
-            [LARM] = { from = LHND, to = LARM, up_up = LSLD },
-
-            [RTHY] = { from = RCLF, to = RTHY, up_up = SPNE },
-            [RCLF] = { from = RFOT, to = RCLF, up_up = RTHY },
-
-            [LTHY] = { from = LCLF, to = LTHY, up_up = SPNE },
-            [LCLF] = { from = LFOT, to = LCLF, up_up = LTHY },
-
-            [RHND] = { from_sensor = SENSORBONE.HAND_RIGHT, to_sensor = SENSORBONE.WRIST_RIGHT, up_lft = RARM },
-            [LHND] = { from_sensor = SENSORBONE.HAND_LEFT, to_sensor = SENSORBONE.WRIST_LEFT, up_rgt = LARM }
-        },
-
-        -- Small cleanup pass after the engine has solved pos/ang from the
-        -- tables above. This intentionally does NOT touch anything the
-        -- solver already computed correctly.
-        Complete = function(self, player, sensor, rotation, pos, ang)
-            if not pos or not ang then return end
-
-            -- Curve the torso slightly toward the head instead of a rigid line.
-            if pos[SPNE] and pos[HEAD] then
-                pos[SPNE] = LerpVector(0.45, pos[SPNE], pos[HEAD])
-            end
-
-            -- Keep the feet flat under the calves rather than at whatever
-            -- angle the raw Kinect ankle/foot data implies.
-            if ang[LCLF] then
-                ang[LFOT] = ang[LCLF]:Right():AngleEx(ang[LCLF]:Up()) + Angle(20, 0, 0)
-            end
-            if ang[RCLF] then
-                ang[RFOT] = ang[RCLF]:Right():AngleEx(ang[RCLF]:Up()) + Angle(20, 0, 0)
-            end
-
-            DriveExtras(pos, ang)
-        end,
-
-        IsApplicable = function(self, ent)
-            if not IsValid(ent) then return false end
-            local model = ent:GetModel()
-            if not model then return false end
-            return string.EndsWith(model, mdl)
+        for i in pairs(parent) do
+            if not placed[i] then parent[i] = R.PLVS order[#order + 1] = i placed[i] = true end
         end
-    }
 
-    if profileName and Kinect_ApplyProfile then
-        Kinect_ApplyProfile(profileName, Builder, {
-            PLVS = PLVS, SPNE = SPNE, RSLD = RSLD, LSLD = LSLD, LARM = LARM, LHND = LHND,
-            RARM = RARM, RHND = RHND, RTHY = RTHY, RCLF = RCLF, HEAD = HEAD,
-            LTHY = LTHY, LCLF = LCLF, LFOT = LFOT, RFOT = RFOT,
-        }, DriveExtras)
-        print("[Kinect Skeleton] Using rig profile:", profileName)
-    end
-
-    do
-        local mode = calibCvar and string.lower(calibCvar:GetString()) or "arms"
-        if Kinect_ApplyCalibration(Builder, {
-            PLVS = PLVS, SPNE = SPNE, RSLD = RSLD, LSLD = LSLD, LARM = LARM, LHND = LHND,
-            RARM = RARM, RHND = RHND, RTHY = RTHY, RCLF = RCLF, HEAD = HEAD,
-            LTHY = LTHY, LCLF = LCLF, LFOT = LFOT, RFOT = RFOT,
-        }, ent, mode, DriveExtras) then
-            print("[Kinect Skeleton] Rest-pose calibration active for:", mode)
+        local relPos, relAng = {}, {}
+        for _, i in ipairs(order) do
+            local p = parent[i]
+            if p then relPos[i], relAng[i] = WorldToLocal(restPos[i], restAng[i], restPos[p], restAng[p]) end
         end
+
+        local roleOf = {}
+        for role, idx in pairs(R) do roleOf[idx] = role end
+        if fixed then roleOf[R.RHND], roleOf[R.LHND] = nil, nil end -- hands just follow the forearms
+
+        -- Free bodies are left to the physics engine (their joints to the ragdoll keep them attached),
+        -- together with everything hanging off them, so a 3-body tie swings as a chain.
+        local free = {}
+        for _, i in ipairs(order) do
+            if not roleOf[i] and i ~= R.PLVS and (freeSeed[i] or (parent[i] and free[parent[i]])) then free[i] = true end
+        end
+
+        RT.models[mdl] = { R = R, offset = offset, parent = parent, order = order, free = free,
+                           relPos = relPos, relAng = relAng, roleOf = roleOf, bodies = #order, fixed = fixed and true or false }
+        if RT.Save then RT.Save(mdl) end
+        print(string.format("[Kinect Skeleton] Retarget data recorded for %s (%d bodies%s)", mdl, #order, fixed and ", fixed hands" or ""))
+        if #pinnedNames > 0 then
+            if extrasMode >= 2 then
+                local n = table.Count(free)
+                print("[Kinect Skeleton] " .. n .. " accessory bodies ragdoll freely (" .. table.concat(pinnedNames, ", ") .. ", plus anything hanging off them)")
+            else
+                print("[Kinect Skeleton] Pinned " .. #pinnedNames .. " accessory bodies to the nearest driven body: " .. table.concat(pinnedNames, ", "))
+            end
+        end
+        return true, warn
     end
 
-    --------------------------------------------------------
-    -- FIXED HAND MODE (wrists copy the forearm angle instead of tracking
-    -- the Kinect's hand joints, for when hand tracking is too jittery)
-    --------------------------------------------------------
+    ------------------------------------------------------------
+    -- Saving / autoloading / undoing a conversion
+    -- Saved per model in data/kinect_mapping_editor/retarget/. A saved
+    -- conversion is loaded automatically the first time that model is
+    -- controlled (kinect_converter_autoload 0 turns this off).
+    ------------------------------------------------------------
+    local SAVE_DIR = "kinect_mapping_editor/retarget"
+    local autoloadCvar = CreateConVar("kinect_converter_autoload", "1", FCVAR_ARCHIVE, "1 = load a saved conversion automatically for a model")
 
-    if fixed then
-        Builder.AnglesTable[RHND] = Builder.AnglesTable[RARM]
-        Builder.AnglesTable[LHND] = Builder.AnglesTable[LARM]
+    local function SavePath(mdl)
+        local safe = string.sub(string.gsub(mdl, "[^%w]", "_"), -80)
+        return SAVE_DIR .. "/" .. safe .. "_" .. util.CRC(mdl) .. ".json"
     end
 
-    --------------------------------------------------------
-    -- REGISTER (one builder per model; re-applying replaces it)
-    --------------------------------------------------------
+    local function Serialize(mdl, M)
+        local bodies = {}
+        for _, i in ipairs(M.order) do
+            local e = { i = i, f = (M.free and M.free[i]) or nil }
+            local p = M.parent[i]
+            if p then
+                e.p = p
+                e.rp = { M.relPos[i].x, M.relPos[i].y, M.relPos[i].z }
+                e.ra = { M.relAng[i].p, M.relAng[i].y, M.relAng[i].r }
+            end
+            bodies[#bodies + 1] = e
+        end
+        local offset = {}
+        for role, a in pairs(M.offset) do offset[role] = { a.p, a.y, a.r } end
+        return { version = 1, model = mdl, R = M.R, offset = offset, bodies = bodies, fixed = M.fixed and true or false }
+    end
 
-    local name = "AnatomicalKinect_" .. mdl
+    local function Deserialize(t)
+        if type(t) ~= "table" or t.version ~= 1 or type(t.R) ~= "table" or type(t.bodies) ~= "table" then return nil end
+        local M = { R = {}, offset = {}, parent = {}, order = {}, relPos = {}, relAng = {}, roleOf = {}, free = {}, fixed = t.fixed }
+        for _, role in ipairs(CAL_ROLES) do
+            local idx = tonumber(t.R[role])
+            local o = t.offset and t.offset[role]
+            if not idx or type(o) ~= "table" then return nil end
+            M.R[role] = idx
+            M.offset[role] = Angle(o[1], o[2], o[3])
+            M.roleOf[idx] = role
+        end
+        if t.fixed then M.roleOf[M.R.RHND], M.roleOf[M.R.LHND] = nil, nil end
+        for _, e in ipairs(t.bodies) do
+            local i = tonumber(e.i)
+            if not i then return nil end
+            M.order[#M.order + 1] = i
+            if e.f then M.free[i] = true end
+            if e.p then
+                M.parent[i] = tonumber(e.p)
+                M.relPos[i] = Vector(e.rp[1], e.rp[2], e.rp[3])
+                M.relAng[i] = Angle(e.ra[1], e.ra[2], e.ra[3])
+            end
+        end
+        M.bodies = #M.order
+        return M
+    end
 
-    list.Set("SkeletonConvertor", name, Builder)
+    function RT.Save(mdl)
+        local M = RT.models[mdl]
+        if not M then return false end
+        file.CreateDir("kinect_mapping_editor")
+        file.CreateDir(SAVE_DIR)
+        file.Write(SavePath(mdl), util.TableToJSON(Serialize(mdl, M)))
+        return true
+    end
 
-    print("[Kinect Skeleton] Registered:", name, fixed and "(fixed-hand mode)" or "")
+    function RT.LoadSaved(mdl)
+        if not autoloadCvar:GetBool() then return nil end
+        local raw = file.Read(SavePath(mdl), "DATA")
+        local M = raw and Deserialize(util.JSONToTable(raw))
+        if M then
+            RT.models[mdl] = M
+            print("[Kinect Skeleton] Loaded saved conversion for " .. mdl)
+        end
+        return M
+    end
+
+    function RT.HasSaved(mdl) return file.Exists(SavePath(mdl), "DATA") end
+
+    -- Undo: stop anything using it, forget it, delete the saved file.
+    function RT.Forget(mdl)
+        for e in pairs(RT.active) do
+            if IsValid(e) and e:GetModel() == mdl then RT.Stop(e) end
+        end
+        local had = RT.models[mdl] ~= nil or file.Exists(SavePath(mdl), "DATA")
+        RT.models[mdl] = nil
+        file.Delete(SavePath(mdl))
+        return had
+    end
+
+    local function ReadJoints(st)
+        local sm = math.Clamp(GetConVar("kinect_converter_smooth"):GetFloat(), 0, 0.95)
+        local empty = 0
+        local raw = {}
+        for i = 0, 19 do
+            local v = Vector(st.source(i))
+            raw[i] = v
+            if math.abs(v.x) <= 0.05 and math.abs(v.y) <= 0.05 then empty = empty + 1 end
+        end
+        if empty > 5 then return false end -- sensor lost the body: keep the last pose
+        -- the stage prop can be moved/turned/rescaled while running, so read it every tick
+        local stage = st.stage
+        local rot, scale = st.rot, st.scale
+        if IsValid(stage) then
+            rot = stage:GetAngles()
+            rot:RotateAroundAxis(rot:Up(), -90) -- same as the stock controller
+            scale = stage:GetScale()
+        end
+        st.curRot, st.curScale = rot, scale
+        for i = 0, 19 do
+            st.Jraw[i] = st.Jraw[i] and LerpVector(1 - sm, st.Jraw[i], raw[i]) or raw[i]
+            local v = Vector(st.Jraw[i])
+            v:Rotate(rot)
+            st.J[i] = v
+        end
+        return true
+    end
+
+    local function Solve(st)
+        if not ReadJoints(st) then return nil end
+        local M, J = st.model, st.J
+        local P = {}
+        for _, role in ipairs(CAL_ROLES) do P[role] = J[RoleJoint(role)] end
+        P.RHAND, P.LHAND = J[SENSORBONE.HAND_RIGHT], J[SENSORBONE.HAND_LEFT]
+        local bendCv = GetConVar("kinect_converter_hand_bend")
+        P.HANDBEND = bendCv and bendCv:GetFloat() or 0
+        local live = CalFrames(P)
+        if not live then return nil end
+
+        local pelvis = M.R.PLVS
+        local scale = st.curScale
+        if not st.placed then
+            -- first good frame: put the stage so the ragdoll stays where it is
+            local root = st.ent:GetPhysicsObjectNum(pelvis)
+            if not IsValid(root) then return nil end
+            st.center = root:GetPos() - J[SENSORBONE.HIP] * scale
+            if IsValid(st.stage) then st.stage:SetPos(st.center) end
+            st.placed = true
+            st.needGround = true
+        end
+        if IsValid(st.stage) then st.center = st.stage:GetPos() end
+
+        local pos, ang = {}, {}
+        for _, i in ipairs(M.order) do
+            local role = M.roleOf[i]
+            if M.free and M.free[i] and st.freeSeeded then
+                -- left to physics: no target is set for this body (it was placed once on the first frame)
+            elseif i == pelvis then
+                pos[i] = st.center + J[SENSORBONE.HIP] * scale
+                local _, a = LocalToWorld(vector_origin, M.offset.PLVS, vector_origin, live.PLVS)
+                ang[i] = a
+            else
+                local p = M.parent[i]
+                local fp, fa = LocalToWorld(M.relPos[i], M.relAng[i], pos[p], ang[p])
+                pos[i] = fp
+                if role then
+                    local _, a = LocalToWorld(vector_origin, M.offset[role], vector_origin, live[role])
+                    ang[i] = a
+                else
+                    ang[i] = fa -- not a Kinect role: follows its parent
+                end
+            end
+        end
+
+        -- First frame only: the ragdoll keeps its current pelvis position, but a ragdoll that was
+        -- lying down has its pelvis near the floor, and the standing pose then puts the legs through
+        -- it. Lift the whole pose (and the stage, so it stays lifted) until the lowest body clears
+        -- the floor underneath.
+        if st.needGround then
+            st.needGround = false
+            local cv = GetConVar("kinect_converter_autoground")
+            if cv and cv:GetBool() and pos[pelvis] then
+                local minZ = math.huge
+                for _, p in pairs(pos) do if p.z < minZ then minZ = p.z end end
+                local from = pos[pelvis]
+                local filter = { st.ent, st.ply }
+                if IsValid(st.stage) then filter[#filter + 1] = st.stage end
+                local tr = util.TraceLine({
+                    start = from + Vector(0, 0, 48), endpos = from - Vector(0, 0, 4096),
+                    mask = MASK_SOLID, filter = filter,
+                })
+                if tr.Hit and not tr.StartSolid then
+                    local dz = (tr.HitPos.z + 6) - minZ -- bodies are centred a few units above their lowest point
+                    if dz > 0.5 then
+                        local up = Vector(0, 0, dz)
+                        for k, p in pairs(pos) do pos[k] = p + up end
+                        st.center = st.center + up
+                        if IsValid(st.stage) then st.stage:SetPos(st.center) end
+                    end
+                end
+            end
+        end
+        st.freeSeeded = true
+        return pos, ang
+    end
+
+    function RT.Stop(ent)
+        local st = RT.active[ent]
+        RT.active[ent] = nil
+        if IsValid(ent) then ent:SetRagdollBuildFunction(nil) end
+        if st and IsValid(st.stage) then
+            if IsValid(ent) and ent.MotionSensorController == st.stage then ent.MotionSensorController = nil end
+            st.stage:Remove()
+        end
+        return st ~= nil
+    end
+
+    -- source(i) must return the raw joint i (0..19) as a Vector; the caller owns the copy.
+    function RT.Start(ent, ply, source, opts)
+        opts = opts or {}
+        if not IsValid(ent) or not IsValid(ply) then return false, "No ragdoll or player" end
+        local mdlName = ent:GetModel()
+        local model = RT.models[mdlName]
+        local autoloaded = false
+        if not model and RT.LoadSaved then
+            model = RT.LoadSaved(mdlName)
+            autoloaded = model ~= nil
+        end
+        if not model then return false, "Press Apply Conversion for this model first." end
+        local maxIdx = 0
+        for _, i in ipairs(model.order) do maxIdx = math.max(maxIdx, i) end
+        if maxIdx >= ent:GetPhysicsObjectCount() then
+            return false, "The saved conversion does not match this ragdoll's physics (different model version?). Use Undo Conversion, then Apply again."
+        end
+        if autoloaded then ply:ChatPrint("[Kinect Skeleton] Loaded the saved conversion for this model.") end
+        RT.Stop(ent)
+        if IsValid(ent.MotionSensorController) then ent.MotionSensorController:Remove() end
+
+        for i = 0, ent:GetPhysicsObjectCount() - 1 do
+            local o = ent:GetPhysicsObjectNum(i)
+            if IsValid(o) then o:EnableMotion(true) o:Wake() end
+        end
+        ent.KinectFrozen = false
+
+        local theta = opts.theta or (ply:EyeAngles().y + GetConVar("kinect_converter_yaw_offset"):GetFloat())
+        local st = {
+            ent = ent, ply = ply, model = model, source = source, J = {}, Jraw = {},
+            rot = Angle(0, theta - 90, 0),
+            scale = opts.scale or GetConVar("kinect_converter_scale"):GetFloat(),
+        }
+        st.curRot, st.curScale = st.rot, st.scale
+
+        -- The same Kinect "stage" prop the stock controller spawns: grab it to move the
+        -- ragdoll, turn it to change facing, and edit Scale in its context-menu
+        -- properties. It only carries those settings; this controller does the posing.
+        if not opts.noStage then
+            local stage = ents.Create("ragdoll_motion")
+            if IsValid(stage) then
+                stage:SetPos(ply:EyePos() + ply:EyeAngles():Forward() * 10)
+                stage:SetAngles(Angle(0, theta, 0))
+                stage:SetController(ply)
+                stage:SetTarget(ent)
+                stage:Spawn()
+                stage:SetScale(st.scale)
+                stage:SetDebug(false) -- no stock debug drawing on the stage
+                ent.MotionSensorController = stage
+                st.stage = stage
+                st.hadStage = true
+                undo.Create("ragdoll_motion")
+                    undo.AddEntity(stage)
+                    undo.SetPlayer(ply)
+                undo.Finish()
+            end
+        end
+        RT.active[ent] = st
+
+        ent:PhysWake()
+        ent:SetRagdollBuildFunction(function(r)
+            if not IsValid(st.ply) or (st.hadStage and not IsValid(st.stage)) then RT.Stop(r) return end
+            local pos, ang = Solve(st)
+            if pos then st.lastPos, st.lastAng = pos, ang else pos, ang = st.lastPos, st.lastAng end
+            if not pos then return end
+            for i, p in pairs(pos) do
+                r:SetRagdollPos(i, p)
+                r:SetRagdollAng(i, ang[i])
+            end
+            r:RagdollUpdatePhysics()
+            local fr = st.model.free
+            if fr then
+                for i in pairs(fr) do
+                    local o = r:GetPhysicsObjectNum(i)
+                    if IsValid(o) and o:IsAsleep() then o:Wake() end
+                end
+            end
+        end)
+        return true
+    end
+
+    hook.Add("EntityRemoved", "KinectRetargetCleanup", function(e) RT.active[e] = nil end)
+
+    concommand.Add("kinect_converter_stop", function(ply)
+        for e in pairs(RT.active) do RT.Stop(e) end
+    end)
 end
 
+function SetBuilder(tbl, mdl, fixed, ent, swap)
+    if SERVER then return Kinect_RegisterRetarget(tbl, mdl, fixed, ent, swap) end
+end
+
+-- Right-click a ragdoll -> Control with Motion Sensor (converted). Works for
+-- any ragdoll that has been through Apply Conversion; click again to stop.
+properties.Add("kinect_converted_control", {
+    MenuLabel = "Control with Motion Sensor (converted)",
+    Order = 2501,
+    MenuIcon = "icon16/controller.png",
+    Filter = function(self, ent, ply)
+        if CLIENT and (not motionsensor or not motionsensor.IsAvailable()) then return false end
+        if not IsValid(ent) or not ent:IsRagdoll() then return false end
+        if not gamemode.Call("CanProperty", ply, "kinect_converted_control", ent) then return false end
+        return true
+    end,
+    Action = function(self, ent)
+        self:MsgStart()
+        net.WriteEntity(ent)
+        self:MsgEnd()
+        if not motionsensor.IsActive() then motionsensor.Start() end
+    end,
+    Receive = function(self, length, ply)
+        local ent = net.ReadEntity()
+        if not self:Filter(ent, ply) then return end
+        local running = RT.active[ent]
+        if running and (not running.hadStage or IsValid(running.stage)) then
+            RT.Stop(ent)
+            ply:ChatPrint("[Kinect Skeleton] Stopped controlling that ragdoll.")
+            return
+        end
+        local ok, msg = RT.Start(ent, ply, function(i) return ply:MotionSensorPos(i) end)
+        if not ok then ply:ChatPrint("[Kinect Skeleton] " .. tostring(msg)) end
+    end,
+})
 
 ------------------------------------------------------------
 -- VISUAL BONE MAPPING EDITOR
@@ -855,6 +909,7 @@ end
 
 local EDIT_APPLY = "KinectEditor_Apply_v1"
 local EDIT_RESULT = "KinectEditor_Result_v1"
+local EDIT_UNDO = "KinectEditor_Undo_v1"
 local EDIT_VALIDATE_BONE = "KinectEditor_ValidateBone_v1"
 local EDIT_VALIDATE_REPLY = "KinectEditor_ValidateBoneReply_v1"
 local EDIT_POSE = "KinectEditor_Pose_v1"
@@ -886,6 +941,7 @@ local openEditor -- shared upvalue for the right-click Action callback
 if SERVER then
     util.AddNetworkString(EDIT_APPLY)
     util.AddNetworkString(EDIT_RESULT)
+    util.AddNetworkString(EDIT_UNDO)
     util.AddNetworkString(EDIT_VALIDATE_BONE)
     util.AddNetworkString(EDIT_VALIDATE_REPLY)
     util.AddNetworkString(EDIT_POSE)
@@ -1305,25 +1361,21 @@ if SERVER then
     local function StopTestRig()
         hook.Remove("Think", "KinectTestRig")
         if TR.active then
-            if IsValid(TR.active.rm) then TR.active.rm:Remove() end
+            if IsValid(TR.active.ent) then Kinect_Retarget.Stop(TR.active.ent) end
             if IsValid(TR.active.clone) then TR.active.clone:Remove() end
             TR.active = nil
         end
-        local meta = FindMetaTable("Player")
-        if meta and TR.orig then meta.MotionSensorPos = TR.orig end
-        TR.orig = nil
     end
 
     -- asClone: run the test on an invisible duplicate of the ragdoll instead of
-    -- the real one (used by the in-window dance preview, which mirrors the
-    -- duplicate's bones onto the preview model). Returns the entity driven.
+    -- the real one (used by the in-window dance preview, which draws the
+    -- duplicate inside the preview panel). Returns the entity driven.
     local function StartTestRig(ply, srcEnt, asClone)
         StopTestRig()
         local ent = srcEnt
         local clone
-        local builderName = "AnatomicalKinect_" .. srcEnt:GetModel()
-        if not list.GetEntry("SkeletonConvertor", builderName) then
-            ply:ChatPrint("[Kinect Skeleton] Press Apply Conversion first -- there is no converted builder for this model yet.")
+        if not Kinect_Retarget.models[srcEnt:GetModel()] and not (Kinect_Retarget.LoadSaved and Kinect_Retarget.LoadSaved(srcEnt:GetModel())) then
+            ply:ChatPrint("[Kinect Skeleton] Press Apply Conversion first -- there is no converted data for this model yet.")
             return false
         end
         local clipName = GetConVar("kinect_testrig_clip"):GetString()
@@ -1340,55 +1392,34 @@ if SERVER then
             clone:SetPos(srcEnt:GetPos() + ply:GetRight() * 220)
             clone:Spawn()
             clone:Activate()
-            clone:SetRenderMode(RENDERMODE_TRANSALPHA)
-            clone:SetColor(Color(255, 255, 255, 0))
             clone:DrawShadow(false)
-            clone:SetNoDraw(true) -- model materials can ignore alpha, so also hide it outright
+            clone:SetNoDraw(true) -- hidden: the preview panel draws it
             clone:SetCollisionGroup(COLLISION_GROUP_WORLD)
             ent = clone
         end
 
-        -- Stand the ragdoll up and let go of it; the controller takes over below.
+        -- Stand the ragdoll up (so it starts from a sane pose); the controller takes over below.
         StandRagdoll(ent, ply)
         ReleaseRagdoll(ent)
-        local root = ent:GetPhysicsObjectNum(0)
-        if not IsValid(root) then return false end
 
-        local theta = ply:EyeAngles().y + 180
-        local hip = Vector(clip.frames[1][SENSORBONE.HIP])
-        hip:Rotate(Angle(0, theta - 90, 0))
-        local center = root:GetPos() - hip * TR_SCALE
-
-        local rm = ents.Create("ragdoll_motion")
-        if not IsValid(rm) then ply:ChatPrint("[Kinect Skeleton] Could not create a test controller.") return false end
-        rm:SetPos(center)
-        rm:SetAngles(Angle(0, theta, 0))
-        rm:SetRagdoll(ent)
-        rm:SetController(ply)
-        rm:Spawn()
-        local rmPhys = rm:GetPhysicsObject()
-        if IsValid(rmPhys) then rmPhys:EnableMotion(false) end
-        if asClone then rm:SetNoDraw(true) end
-
-        local meta = FindMetaTable("Player")
-        TR.orig = meta.MotionSensorPos
-        TR.active = { ply = ply, rm = rm, clone = clone, clip = clip, start = CurTime(), frame = 1 }
-        meta.MotionSensorPos = function(p, i)
-            local a = TR.active
-            if a and a.ply == p then
-                return Vector(a.clip.frames[a.frame][i]) -- copy: callers rotate it in place
-            end
-            if TR.orig then return TR.orig(p, i) end
-            return Vector(0, 0, 0)
+        local a = { ply = ply, ent = ent, clone = clone, clip = clip, start = CurTime(), frame = 1 }
+        TR.active = a
+        local ok, msg = Kinect_Retarget.Start(ent, ply, function(i)
+            return Vector(a.clip.frames[a.frame][i]) -- copy: callers rotate it in place
+        end, { theta = ply:EyeAngles().y + 180, scale = TR_SCALE, noStage = true })
+        if not ok then
+            ply:ChatPrint("[Kinect Skeleton] " .. tostring(msg))
+            StopTestRig()
+            return false
         end
 
         hook.Add("Think", "KinectTestRig", function()
-            local a = TR.active
-            if not a or not IsValid(a.ply) or not IsValid(ent) or not IsValid(a.rm) or CurTime() - a.start > 120 then
+            local t = TR.active
+            if not t or not IsValid(t.ply) or not IsValid(t.ent) or CurTime() - t.start > 120 then
                 StopTestRig()
                 return
             end
-            a.frame = math.floor((CurTime() - a.start) * a.clip.fps) % #a.clip.frames + 1
+            t.frame = math.floor((CurTime() - t.start) * t.clip.fps) % #t.clip.frames + 1
         end)
         return asClone and clone or true
     end
@@ -1563,10 +1594,41 @@ if SERVER then
             end
         end
 
-        SetBuilder(map, ent:GetModel(), fixed, ent, swap)
+        -- Make sure the rest pose is a standing one (the recorded offsets depend on it).
+        if not ent.KinectFrozen then StandRagdoll(ent, ply) end
+        local ok, msg = Kinect_RegisterRetarget(map, ent:GetModel(), fixed, ent, swap)
         ReleaseRagdoll(ent)
-        ent.KinectEditorLastBuilder = "AnatomicalKinect_" .. ent:GetModel()
-        report(true, "Mapping registered. If a Kinect controller is already attached, detach and reattach it to pick up the new builder.")
+        if not ok then report(false, tostring(msg)) return end
+        ent.KinectEditorLastBuilder = "retarget:" .. ent:GetModel()
+        report(true, "Conversion recorded and saved for this model (it loads automatically next time). Now right-click the ragdoll -> 'Control with Motion Sensor (converted)'." .. (msg and (" NOTE: " .. msg) or ""))
+    end)
+
+    local function UndoConversion(ent, ply)
+        local mdl = ent:GetModel()
+        local had = Kinect_Retarget.Forget(mdl)
+        if IsValid(ent.MotionSensorController) then ent.MotionSensorController:Remove() end
+        ReleaseRagdoll(ent)
+        ent.KinectEditorLastBuilder = nil
+        return had
+    end
+
+    net.Receive(EDIT_UNDO, function(_, ply)
+        local ent = net.ReadEntity()
+        if not IsValid(ply) or not IsValid(ent) or not ent:IsRagdoll() then return end
+        if ply:GetPos():DistToSqr(ent:GetPos()) > 1500 * 1500 then return end
+        local had = UndoConversion(ent, ply)
+        net.Start(EDIT_RESULT)
+        net.WriteBool(true)
+        net.WriteString(had and "Conversion undone: stopped any converted control, forgot the recorded pose and deleted the saved copy for this model. The ragdoll is back to normal."
+                            or "There was no conversion recorded for this model.")
+        net.Send(ply)
+    end)
+
+    concommand.Add("kinect_converter_undo", function(ply)
+        if not IsValid(ply) then return end
+        local ent = ply:GetEyeTrace().Entity
+        if not IsValid(ent) or not ent:IsRagdoll() then ply:ChatPrint("[Kinect Skeleton] Aim at the ragdoll first.") return end
+        ply:ChatPrint(UndoConversion(ent, ply) and "[Kinect Skeleton] Conversion undone for this model." or "[Kinect Skeleton] No conversion was recorded for this model.")
     end)
 
     concommand.Add("kinect_editor_status", function(ply)
@@ -1758,6 +1820,21 @@ else
         save:SetPos(240, 36) save:SetSize(160, 32) save:SetText("Save Setup")
         local load = vgui.Create("DButton", bottom)
         load:SetPos(412, 36) load:SetSize(160, 32) load:SetText("Load Setup")
+
+        local undoBtn = vgui.Create("DButton", bottom)
+        undoBtn:SetPos(240, 78) undoBtn:SetSize(160, 32)
+        undoBtn:SetText("Undo Conversion")
+        undoBtn:SetTooltip("Forgets the recorded conversion for this model (and its saved copy) and stops any converted control.")
+        undoBtn.DoClick = function()
+            if not IsValid(ent) then status:SetText("Selected ragdoll no longer exists") return end
+            Derma_Query("Undo the conversion for this model? This stops converted control and deletes its saved copy. Your bone mapping setups are kept.",
+                "Undo Conversion",
+                "Undo", function()
+                    net.Start(EDIT_UNDO) net.WriteEntity(ent) net.SendToServer()
+                    status:SetText("Undoing conversion...")
+                end,
+                "Cancel")
+        end
 
         local diagnose = vgui.Create("DButton", bottom)
         diagnose:SetPos(8, 78) diagnose:SetSize(220, 32)
@@ -2341,33 +2418,31 @@ else
         -- Dance in Preview: the server runs the REAL conversion on an invisible
         -- duplicate ragdoll; this mirrors that duplicate's bones onto the
         -- preview model every frame.
-        local mirrorCallback
-        local function installMirror()
-            if mirrorCallback or not IsValid(model.Entity) then return end
-            local pe = model.Entity
-            mirrorCallback = pe:AddCallback("BuildBonePositions", function(e, nbones)
-                local c = state.mirror
-                if not IsValid(c) or not IsValid(e) then return end
-                c:SetupBones() -- keep the (hidden) source's bones current even though it is not drawn
-                local rootC = c:GetBoneMatrix(0)
-                local rootP = e:GetBoneMatrix(0)
-                if not rootC or not rootP then return end
-                local inv = rootC:GetInverse()
-                if not inv then return end
-                state.mirrorFrames = (state.mirrorFrames or 0) + 1
-                for i = 0, nbones - 1 do
-                    local m = c:GetBoneMatrix(i)
-                    if m then
-                        local fm = rootP * (inv * m)
-                        e:SetBonePosition(i, fm:GetTranslation(), fm:GetAngles())
-                    end
-                end
-            end)
+        -- The preview model is not posed at all. Instead the preview hides its
+        -- own model and draws the server's converted duplicate inside the panel,
+        -- moved so the duplicate's root sits where the preview's root is.
+        model.PreDrawModel = function(self, pe)
+            local c = state.mirror
+            if not IsValid(c) or not IsValid(pe) then return true end
+            pe:SetupBones()
+            c:SetupBones() -- keep the hidden duplicate's bones current
+            local rootC = c:GetBoneMatrix(0)
+            local rootP = pe:GetBoneMatrix(0)
+            if not rootC or not rootP then return true end
+            local inv = rootC:GetInverse()
+            if not inv then return true end
+            state.mirrorFrames = (state.mirrorFrames or 0) + 1
+            cam.PushModelMatrix(rootP * inv)
+            c:DrawModel()
+            cam.PopModelMatrix()
+            return false -- do not draw the idle preview pose
         end
         local function stopDance(notifyServer)
+            state.mirror = nil
+            timer.Remove("KinectDanceMirrorLookup")
+            if not IsValid(danceButton) then return end -- window already closed
             danceButton.running = false
             danceButton:SetText("Dance in Preview")
-            state.mirror = nil
             if notifyServer and IsValid(ent) then
                 net.Start(EDIT_DANCE) net.WriteEntity(ent) net.WriteBool(false) net.SendToServer()
             end
@@ -2393,15 +2468,18 @@ else
             local tries = 0
             timer.Create("KinectDanceMirrorLookup", 0.1, 50, function()
                 tries = tries + 1
+                if not IsValid(frame) or not IsValid(model) or not IsValid(danceButton) then
+                    timer.Remove("KinectDanceMirrorLookup") -- window was closed
+                    return
+                end
                 local c = Entity(index)
                 if IsValid(c) and IsValid(model) and IsValid(model.Entity) then
-                    installMirror()
                     state.mirror = c
                     state.mirrorFrames = 0
                     status:SetText("Dance preview running: this is the real conversion output on a hidden copy")
                     timer.Simple(1.5, function()
-                        if danceButton.running and IsValid(status) and (state.mirrorFrames or 0) == 0 then
-                            status:SetText("Dance is running on the server, but the preview did not receive bone data (callback not firing)")
+                        if IsValid(danceButton) and danceButton.running and IsValid(status) and (state.mirrorFrames or 0) == 0 then
+                            status:SetText("Dance is running on the server, but the preview could not draw it")
                         end
                     end)
                     timer.Remove("KinectDanceMirrorLookup")
@@ -2415,6 +2493,7 @@ else
         frame.OnRemove = function()
             state.testActive = false
             state.mirror = nil
+            timer.Remove("KinectDanceMirrorLookup")
             if IsValid(model.Entity) then clearTestAngles() end
             if editor == state then editor = nil end
             if IsValid(ent) then
