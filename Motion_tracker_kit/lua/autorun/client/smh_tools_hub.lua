@@ -20,6 +20,16 @@ local STRIP_H = 28
 local BAR_H = 90 -- height of the SMH timeline bar
 local stickyCvar = CreateClientConVar("smh_hub_sticky", "1", true, false, "SMH menu key toggles instead of hold")
 
+-- The SMH plugin (tool strip, sticky menu key, running list) is only active while SMH is installed
+-- and chosen as the animation addon in the GMMT Hub (gmmt_addon = smh).
+function Hub.Enabled()
+    if not (SMH and SMH.UI and isfunction(SMH.UI.Open)) then return false end
+    local cv = GetConVar("gmmt_addon")
+    if cv and cv:GetString() ~= "smh" then return false end
+    local pc = GetConVar("gmmt_smh_plugin")
+    return pc == nil or pc:GetBool()
+end
+
 -- tool = { id, name, open=fn, close=fn, isOpen=fn, isActive=fn, status=fn }
 function Hub.Register(tool)
     if not tool or not tool.id then return end
@@ -76,8 +86,8 @@ local function styleButton(b, activeFn)
     b:SetTextColor(color_white)
     b.Paint = function(self, w, h)
         local on = activeFn and activeFn()
-        local col = on and Color(40, 130, 60, 235) or (self:IsHovered() and Color(70, 70, 80, 235) or Color(45, 45, 55, 225))
-        draw.RoundedBox(4, 0, 0, w, h, col)
+        local col = on and Color(60, 140, 90, 240) or (self:IsHovered() and Color(80, 82, 90, 240) or Color(50, 51, 56, 235))
+        draw.RoundedBox(5, 0, 0, w, h, col)
     end
 end
 
@@ -102,6 +112,9 @@ local function buildStrip()
         x = x + w + 4
         return b
     end
+    if GMMT and GMMT.UI then
+        add("GMMT Hub", 90, function() GMMT.UI.OpenHub() end)
+    end
     for _, id in ipairs(Hub.order) do
         local t = Hub.tools[id]
         add(t.name, 150, function()
@@ -115,6 +128,7 @@ local function buildStrip()
         function() return timelineHidden and "Show timeline" or "Hide timeline" end)
     add("Close SMH", 90, function() if smhOpen() then SMH.UI.Close() end end)
     strip:SetWide(x - 4)
+    if GMMT and GMMT.UI then GMMT.UI.Style(strip) end   -- click sounds
     strip:MakePopup()
     strip:SetKeyboardInputEnabled(false)
     strip:SetVisible(false)
@@ -122,6 +136,13 @@ local function buildStrip()
 end
 
 hook.Add("Think", "SMHToolsHubStrip", function()
+    if not Hub.Enabled() then
+        if IsValid(strip) and strip:IsVisible() then
+            strip:SetVisible(false)
+            if timelineHidden then setTimelineHidden(false) end
+        end
+        return
+    end
     if Hub.dirty or (#Hub.order > 0 and not IsValid(strip)) then buildStrip() end
     if not IsValid(strip) then return end
     local open = smhOpen()
@@ -142,6 +163,7 @@ end)
 -- Persistent "something is running" list.
 surface.CreateFont("SMHHubStatus", { font = "Arial", size = 18, weight = 700 })
 hook.Add("HUDPaint", "SMHToolsHubStatus", function()
+    if not Hub.Enabled() then return end
     local y = 110
     for _, id in ipairs(Hub.order) do
         local t = Hub.tools[id]
@@ -158,6 +180,7 @@ end)
 -- Sticky menu key: press once to open, press again to close.
 local function installSticky()
     if not stickyCvar:GetBool() then return end
+    if not Hub.Enabled() then return end
     if not (SMH and SMH.UI and SMH.UI.Open) then return end
     concommand.Add("+smh_menu", function()
         if not stickyCvar:GetBool() then SMH.UI.Open() return end
@@ -177,5 +200,22 @@ cvars.AddChangeCallback("smh_hub_sticky", function()
     concommand.Add("-smh_menu", function() SMH.UI.Close() end)
     installSticky()
 end, "SMHToolsHubStickyChange")
+
+-- switching the animation addon in the GMMT Hub turns the SMH menu key back to normal (or sticky again)
+local function addonChanged()
+    if SMH and SMH.UI and SMH.UI.Open then
+        concommand.Add("+smh_menu", function() SMH.UI.Open() end)
+        concommand.Add("-smh_menu", function() SMH.UI.Close() end)
+    end
+    installSticky()
+end
+cvars.AddChangeCallback("gmmt_smh_plugin", addonChanged, "SMHToolsHubPluginToggle")
+cvars.AddChangeCallback("gmmt_addon", function()
+    if SMH and SMH.UI and SMH.UI.Open then
+        concommand.Add("+smh_menu", function() SMH.UI.Open() end)
+        concommand.Add("-smh_menu", function() SMH.UI.Close() end)
+    end
+    installSticky()
+end, "SMHToolsHubAddonChange")
 
 print("[SMH Tools Hub] loaded")

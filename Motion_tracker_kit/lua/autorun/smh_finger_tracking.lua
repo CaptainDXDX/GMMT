@@ -157,15 +157,33 @@ if SERVER then
         end
         st.active = active
         local axis, thumbAxis = net.ReadUInt(2), net.ReadUInt(2)
+        local full = net.ReadBool()   -- experimental full rotation: spread / thumb lift on the first joint
+        local spreadAxis, thumbSpreadAxis, thumbLiftAxis = 0, 0, 0
+        if full then spreadAxis, thumbSpreadAxis, thumbLiftAxis = net.ReadUInt(2), net.ReadUInt(2), net.ReadUInt(2) end
         for _, side in ipairs({ "right", "left" }) do
             local has = net.ReadBool()
             for _, finger in ipairs(FINGERS) do
+                local degs = {}
+                for j = 1, 3 do degs[j] = has and net.ReadFloat() or 0 end
+                local spread, lift = 0, 0
+                if full and has then
+                    spread = net.ReadFloat()
+                    if finger == "thumb" then lift = net.ReadFloat() end
+                end
                 for j = 1, 3 do
-                    local deg = has and net.ReadFloat() or 0
                     local bone = info[side][finger] and info[side][finger][j]
                     if bone then
-                        if not active then deg = 0 end
-                        setTarget(st, bone, makeAngle(finger == "thumb" and thumbAxis or axis, deg))
+                        local isThumb = finger == "thumb"
+                        local ang = makeAngle(isThumb and thumbAxis or axis, active and degs[j] or 0)
+                        if j == 1 and full and active then
+                            local k = AXIS[(isThumb and thumbSpreadAxis or spreadAxis)] or "p"
+                            ang[k] = ang[k] + spread
+                            if isThumb then
+                                local k2 = AXIS[thumbLiftAxis] or "r"
+                                ang[k2] = ang[k2] + lift
+                            end
+                        end
+                        setTarget(st, bone, ang)
                     end
                 end
             end
@@ -243,6 +261,15 @@ local cv = {
     swap    = CreateClientConVar("smh_finger_swap_hands", "0", true, false),
     compensate = CreateClientConVar("smh_finger_flatten", "1", true, false),
     extraFlat  = CreateClientConVar("smh_finger_extra_flat", "0", true, false),
+    -- experimental full finger rotation (spread + thumb lift)
+    full       = CreateClientConVar("smh_finger_full", "0", true, false),
+    spreadAx   = CreateClientConVar("smh_finger_spread_axis", "0", true, false),
+    thumbSprAx = CreateClientConVar("smh_finger_thumb_spread_axis", "0", true, false),
+    thumbLiftAx = CreateClientConVar("smh_finger_thumb_lift_axis", "2", true, false),
+    spreadScale = CreateClientConVar("smh_finger_spread_scale", "1", true, false),
+    spreadFlip = CreateClientConVar("smh_finger_flip_spread", "0", true, false),
+    thumbSprFlip = CreateClientConVar("smh_finger_flip_thumb_spread", "0", true, false),
+    thumbLiftFlip = CreateClientConVar("smh_finger_flip_thumb_lift", "0", true, false),
     -- hand rotation
     rotOn   = CreateClientConVar("smh_hand_rot_enabled", "1", true, false),
     rotScale = CreateClientConVar("smh_hand_rot_scale", "1", true, false),
@@ -354,7 +381,7 @@ end
 
 local function blank()
     local t = {}
-    for _, f in ipairs(FINGERS) do t[f] = { 0, 0, 0 } end
+    for _, f in ipairs(FINGERS) do t[f] = { 0, 0, 0, 0, 0 } end
     return t
 end
 
@@ -364,6 +391,13 @@ local function send(active, ent)
     net.WriteBool(active)
     net.WriteUInt(cv.axis:GetInt() % 3, 2)
     net.WriteUInt(cv.thumbAx:GetInt() % 3, 2)
+    local full = cv.full:GetBool()
+    net.WriteBool(full)
+    if full then
+        net.WriteUInt(cv.spreadAx:GetInt() % 3, 2)
+        net.WriteUInt(cv.thumbSprAx:GetInt() % 3, 2)
+        net.WriteUInt(cv.thumbLiftAx:GetInt() % 3, 2)
+    end
     for _, side in ipairs({ "right", "left" }) do
         local d = cur[side]
         net.WriteBool(d ~= nil)
@@ -379,6 +413,12 @@ local function send(active, ent)
                         deg = deg - sign * r -- cancel the model's own default curl
                     end
                     net.WriteFloat(deg)
+                end
+                if full then
+                    local isThumb = f == "thumb"
+                    local ss = cv.spreadScale:GetFloat() * ((isThumb and cv.thumbSprFlip or cv.spreadFlip):GetBool() and -1 or 1)
+                    net.WriteFloat((d[f][4] or 0) * ss)
+                    if isThumb then net.WriteFloat((d[f][5] or 0) * cv.spreadScale:GetFloat() * (cv.thumbLiftFlip:GetBool() and -1 or 1)) end
                 end
             end
         end
@@ -398,7 +438,7 @@ local function stepToward(side, target, alpha)
     end
     for _, f in ipairs(FINGERS) do
         local t = target[f] or { 0, 0, 0 }
-        for j = 1, 3 do c[f][j] = Lerp(alpha, c[f][j], t[j] or 0) end
+        for j = 1, 5 do c[f][j] = Lerp(alpha, c[f][j] or 0, t[j] or 0) end
     end
 end
 
@@ -444,7 +484,8 @@ hook.Add("Think", "SMHFingerTrackingThink", function()
         -- test sweep: all fingers curl and open so you can check axis/direction
         local k = (math.sin((testUntil - now) * 3) * 0.5 + 0.5) * 70
         local t = {}
-        for _, f in ipairs(FINGERS) do t[f] = { k, k, k } end
+        local sp = (k / 70 - 0.5) * 50   -- spread sweeps -25..+25 so the spread axis can be checked too
+        for _, f in ipairs(FINGERS) do t[f] = { k, k, k, sp, math.max(sp, 0) } end
         targets.right, targets.left = t, t
         status = "Test sweep"
     else
@@ -509,7 +550,8 @@ local PRESET_DIR = "smh_finger_presets"
 local MODEL_MAP_FILE = PRESET_DIR .. "/_models.txt"
 local PRESET_KEYS = { "scale", "smooth", "axis", "thumbAx", "flipL", "flipR", "flipT", "swap",
     "compensate", "extraFlat", "rotOn", "rotScale", "twistAx", "flexAx", "sideAx",
-    "twistFlip", "flexFlip", "sideFlip" }
+    "twistFlip", "flexFlip", "sideFlip", "full", "spreadAx", "thumbSprAx", "thumbLiftAx",
+    "spreadScale", "spreadFlip", "thumbSprFlip", "thumbLiftFlip" }
 local presetRefreshers = {}   -- filled by the window's controls
 local currentPreset = nil     -- name of the last applied/saved preset
 local presetCombo
@@ -737,6 +779,18 @@ local function openWindow()
     infoLabel.Think = function(self) self:SetText(serverInfo ~= "" and serverInfo or "(model info appears here after Start)") end
     label("Many models (HL2 5-finger, TF2) start with curled fingers. Flatten measures that at Start and cancels it so an open hand is flat. If fingers still look too curled when your hand is open, raise Extra flatten.", 64, true)
     check("Swap left / right hands", cv.swap)
+
+    -- ---- experimental: full finger rotation ----
+    label("EXPERIMENTAL: full finger rotation", 22)
+    check("Track finger spread + thumb lift (turn on 'Experimental full finger rotation' in GMMT too)", cv.full)
+    slider("Spread strength", cv.spreadScale, 0.2, 1.5, 2)
+    combo("Finger spread axis", cv.spreadAx)
+    combo("Thumb spread axis", cv.thumbSprAx)
+    combo("Thumb lift axis", cv.thumbLiftAx)
+    check("Flip finger spread", cv.spreadFlip)
+    check("Flip thumb spread", cv.thumbSprFlip)
+    check("Flip thumb lift", cv.thumbLiftFlip)
+    label("Adds side-to-side finger spread and thumb opposition on top of the curl. Use Test sweep: fingers should fan out and back; change the axis / flip boxes until they do.", 52, true)
 
     -- ---- hand rotation ----
     label("HAND ROTATION (wrist)", 22)
